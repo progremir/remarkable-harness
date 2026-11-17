@@ -1,0 +1,15 @@
+{
+  "id": "paperterm",
+  "name": "PaperTerm",
+  "version": "0.1.0",
+  "description": "A real terminal for your tablet, with an on-screen keyboard and fast partial e-ink updates.",
+  "application": "paperterm",
+  "qtfb": true,
+  "supportsVirtualKeyboard": true,
+  "supportsRotation": true,
+  "disablesWindowedMode": false,
+  "environment": {
+    "RUST_BACKTRACE": "1",
+    "PAPERTERM_OSK": "off"
+  }
+}

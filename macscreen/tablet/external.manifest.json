@@ -1,0 +1,9 @@
+{
+  "name": "Mac Screen",
+  "application": "run.sh",
+  "qtfb": true,
+  "supportsRotation": true,
+  "environment": {
+    "RUST_BACKTRACE": "1"
+  }
+}

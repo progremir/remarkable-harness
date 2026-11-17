@@ -1,0 +1,7 @@
+#!/bin/sh
+# Start the server for the tablet; log next to the config, including how it exits.
+# The tablet's Tailscale address is kept outside the app, in ~/.config/rmscreen/tablet.
+TABLET=$(cat "$HOME/.config/rmscreen/tablet")
+LOG="$HOME/.config/rmscreen/rmscreen.log"
+"$(dirname "$0")/rmscreen" "$TABLET" >> "$LOG" 2>&1
+echo "rmscreen: exited with status $? at $(date '+%H:%M:%S')" >> "$LOG"

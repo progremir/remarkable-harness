@@ -1,0 +1,10 @@
+{
+  "name": "Diary",
+  "application": "run.sh",
+  "qtfb": true,
+  "supportsRotation": false,
+  "disablesWindowedMode": true,
+  "environment": {
+    "RUST_BACKTRACE": "1"
+  }
+}

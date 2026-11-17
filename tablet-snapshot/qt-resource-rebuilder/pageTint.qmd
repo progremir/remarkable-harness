@@ -1,0 +1,169 @@
+; Page tint: a see-through yellow layer over the interface, controlled by a
+; vertical slider in quick settings, next to the front-light slider.
+; Tap the slider's icon to switch the tint off or back to its last level.
+; The level (layer opacity) is saved in /home/root/.config/page-tint.
+;
+; Requires: qt-command-executor
+
+AFFECT /qml/device/view/main/MainView.qml
+    IMPORT net.asivery.CommandExecutor 1.0
+
+    TRAVERSE ?#root
+        LOCATE AFTER ALL
+        INSERT {
+            Rectangle {
+                id: pageTintOverlay
+                objectName: "pageTintOverlay"
+                anchors.fill: parent
+                z: 100000
+                enabled: false
+                color: "#FFB000"
+                property real level: 0
+                opacity: level
+                visible: level > 0
+
+                CommandExecutor {
+                    id: pageTintOverlayExec
+                }
+
+                Component.onCompleted: {
+                    var r = pageTintOverlayExec.executeCommand("/bin/sh", ["-c", "cat /home/root/.config/page-tint 2>/dev/null"]);
+                    if (typeof r === "string") {
+                        r = JSON.parse(r);
+                    }
+                    var saved = parseFloat(r.stdout);
+                    if (!isNaN(saved)) {
+                        level = saved;
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT
+
+AFFECT /qt/qml/xofm/modules/settings/qml/QuickSettingsWindow.qml
+    IMPORT net.asivery.CommandExecutor 1.0
+
+    TRAVERSE ?#_columnRow
+        LOCATE AFTER Repeater
+        INSERT {
+            ArkControls.Slider {
+                id: pageTintSlider
+                Layout.alignment: Qt.AlignRight | Qt.AlignTop
+
+                // Slider runs 0-100; full scale is this much layer opacity.
+                readonly property real maxOpacity: 0.3
+                property real tint: 0
+                property real previousTint: 60
+                property var overlay: null
+
+                orientation: Qt.Vertical
+                showDividers: true
+                iconSource: "qrc:/ark/icons/highlighter"
+                from: 0
+                to: 100
+                steps: 5
+                value: pageTintSlider.tint
+
+                CommandExecutor {
+                    id: pageTintExec
+                }
+
+                function run(cmd) {
+                    var r = pageTintExec.executeCommand("/bin/sh", ["-c", "unset NOTIFY_SOCKET; " + cmd]);
+                    if (typeof r === "string") {
+                        r = JSON.parse(r);
+                    }
+                    return r;
+                }
+
+                function findOverlay(item) {
+                    if (!item) {
+                        return null;
+                    }
+                    if (item.objectName === "pageTintOverlay") {
+                        return item;
+                    }
+                    var kids = item.children;
+                    for (var i = 0; i < kids.length; i++) {
+                        var found = findOverlay(kids[i]);
+                        if (found) {
+                            return found;
+                        }
+                    }
+                    return null;
+                }
+
+                function setTint(v) {
+                    tint = v;
+                    var opacity = (v / 100 * maxOpacity).toFixed(3);
+                    run("mkdir -p /home/root/.config && echo " + opacity + " > /home/root/.config/page-tint");
+                    if (!overlay) {
+                        var top = pageTintSlider;
+                        while (top.parent) {
+                            top = top.parent;
+                        }
+                        overlay = findOverlay(top);
+                    }
+                    if (overlay) {
+                        overlay.level = parseFloat(opacity);
+                    } else {
+                        console.log("page-tint: overlay not found");
+                    }
+                }
+
+                updateValue: (v) => {
+                    pageTintSlider.setTint(v);
+                }
+
+                onClicked: {
+                    if (tint > 0) {
+                        previousTint = tint;
+                        setTint(0);
+                    } else {
+                        setTint(previousTint > 0 ? previousTint : 60);
+                    }
+                }
+
+                // A keyboard backlight slider (for reMarkable's Type Folio) appears
+                // whenever any keyboard is connected. Other keyboards have no
+                // backlight, so it is just an empty column: hide it, leaving the
+                // two sliders. Widgets load asynchronously, so check a few times.
+                function hideEmptySiblings() {
+                    var row = pageTintSlider.parent;
+                    if (!row) {
+                        return;
+                    }
+                    for (var i = 0; i < row.children.length; i++) {
+                        var c = row.children[i];
+                        if (c.item && String(c.item).indexOf("KeyboardQuickSettingsSlider") === 0) {
+                            c.visible = false;
+                        }
+                    }
+                }
+
+                Timer {
+                    id: pageTintLayoutFix
+                    interval: 50
+                    repeat: true
+                    running: true
+                    property int ticks: 0
+                    onTriggered: {
+                        pageTintSlider.hideEmptySiblings();
+                        if (++ticks >= 10) {
+                            running = false;
+                        }
+                    }
+                }
+
+                Component.onCompleted: {
+                    hideEmptySiblings();
+                    var saved = parseFloat(run("cat /home/root/.config/page-tint 2>/dev/null").stdout);
+                    if (!isNaN(saved)) {
+                        tint = Math.min(100, Math.round(saved / maxOpacity * 5) * 20);
+                    }
+                }
+            }
+        }
+    END TRAVERSE
+END AFFECT

@@ -1,0 +1,802 @@
+diff --git a/external.manifest.json b/external.manifest.json
+index 85b9a8d..910c180 100644
+--- a/external.manifest.json
++++ b/external.manifest.json
+@@ -6,8 +6,10 @@
+   "application": "paperterm",
+   "qtfb": true,
+   "supportsVirtualKeyboard": true,
++  "supportsRotation": true,
+   "disablesWindowedMode": false,
+   "environment": {
+-    "RUST_BACKTRACE": "1"
++    "RUST_BACKTRACE": "1",
++    "PAPERTERM_OSK": "off"
+   }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index e2cb649..e6ecafe 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,8 +1,10 @@
+ //! paperterm — terminal emulator for the reMarkable Paper Pro.
+ //! alacritty_terminal core + native qtfb client + PSF2 renderer + on-screen keyboard.
+ 
++mod evkbd;
+ mod font;
+ mod keys;
++mod orient;
+ mod osk;
+ mod palette;
+ mod qtfb;
+@@ -15,19 +17,22 @@ use std::os::unix::io::AsRawFd;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::mpsc;
+ use std::sync::Arc;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+-use alacritty_terminal::event::{Event, EventListener, WindowSize};
++use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
+ use alacritty_terminal::grid::{Dimensions, Scroll};
+ use alacritty_terminal::term::{Config, LineDamageBounds, Term, TermDamage};
+ use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
+ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+ use polling::{Event as PollEvent, Events, PollMode, Poller};
+ 
+-use crate::render::{TermArea, SCREEN_W};
++use crate::orient::Rot;
++use crate::render::{TermArea, SCREEN_H, SCREEN_W};
+ 
+-const SCREEN_H: usize = 2160;
+ const OSK_H: usize = 460;
++const KBD_SCAN: Duration = Duration::from_secs(2);
++/// Poller keys at and above this belong to keyboards: key = base + fd.
++const KBD_KEY_BASE: usize = 1000;
+ 
+ const FONT_16X32: &[u8] = include_bytes!("../fonts/spleen-16x32.psfu");
+ const FONT_12X24: &[u8] = include_bytes!("../fonts/spleen-12x24.psfu");
+@@ -67,33 +72,94 @@ impl AsRawFd for FdSource {
+     }
+ }
+ 
+-/// Union of dirty pixel rects for one frame.
++/// Dirty rects for one frame, in logical (canvas) coordinates. Kept apart
++/// rather than unioned: two small edits on different lines would otherwise
++/// become one large rect, which is slow to refresh on e-ink.
+ #[derive(Default)]
+ struct DirtyRegion {
+-    rect: Option<(usize, usize, usize, usize)>,
++    rects: Vec<(usize, usize, usize, usize)>,
+ }
+ 
++/// Above this many rects per frame, fall back to a single union.
++const MAX_RECTS: usize = 6;
++
+ impl DirtyRegion {
+     fn add(&mut self, x: usize, y: usize, w: usize, h: usize) {
+-        self.rect = Some(match self.rect {
+-            None => (x, y, w, h),
+-            Some((rx, ry, rw, rh)) => {
++        // Merge with a rect on the same rows (common: one terminal line).
++        for r in &mut self.rects {
++            if r.1 == y && r.3 == h {
++                let x0 = r.0.min(x);
++                let x1 = (r.0 + r.2).max(x + w);
++                *r = (x0, y, x1 - x0, h);
++                return;
++            }
++        }
++        self.rects.push((x, y, w, h));
++    }
++
++    fn union(&self) -> Option<(usize, usize, usize, usize)> {
++        self.rects
++            .iter()
++            .copied()
++            .reduce(|(rx, ry, rw, rh), (x, y, w, h)| {
+                 let x0 = rx.min(x);
+                 let y0 = ry.min(y);
+-                let x1 = (rx + rw).max(x + w);
+-                let y1 = (ry + rh).max(y + h);
+-                (x0, y0, x1 - x0, y1 - y0)
+-            }
+-        });
++                (x0, y0, (rx + rw).max(x + w) - x0, (ry + rh).max(y + h) - y0)
++            })
+     }
+ 
+-    fn flush(&mut self, client: &qtfb::QtfbClient) {
+-        if let Some((x, y, w, h)) = self.rect.take() {
+-            let _ = client.update_partial(x as i32, y as i32, w as i32, h as i32);
++    /// Copy the dirty parts of the canvas to the screen, rotated, and push
++    /// partial e-ink updates for them.
++    fn flush(&mut self, canvas: &[u8], client: &mut qtfb::QtfbClient, rot: Rot) {
++        let rects = if self.rects.len() > MAX_RECTS {
++            self.union().into_iter().collect()
++        } else {
++            std::mem::take(&mut self.rects)
++        };
++        self.rects.clear();
++        let (lw, lh) = (render::canvas_w(), render::canvas_h());
++        for (x, y, w, h) in rects {
++            if x >= lw || y >= lh {
++                continue;
++            }
++            let (w, h) = (w.min(lw - x), h.min(lh - y));
++            if w == 0 || h == 0 {
++                continue;
++            }
++            let (px, py, pw, ph) = orient::blit(
++                canvas,
++                lw,
++                client.framebuffer(),
++                SCREEN_W,
++                SCREEN_H,
++                rot,
++                (x, y, w, h),
++            );
++            let t0 = now_ms();
++            let _ = client.update_partial(px as i32, py as i32, pw as i32, ph as i32);
++            if trace_on() {
++                eprintln!(
++                    "paperterm: trace update {pw}x{ph} sent t={t0} took={}ms",
++                    now_ms() - t0
++                );
++            }
+         }
+     }
+ }
+ 
++pub fn trace_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("PAPERTERM_TRACE").is_ok_and(|v| v == "1"))
++}
++
++/// Wall-clock milliseconds, comparable with evdev event timestamps.
++pub fn now_ms() -> i64 {
++    let d = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap_or_default();
++    d.as_millis() as i64
++}
++
+ fn single_instance_lock() -> bool {
+     let path = std::ffi::CString::new("/tmp/paperterm.lock").unwrap();
+     unsafe {
+@@ -106,6 +172,34 @@ fn single_instance_lock() -> bool {
+     }
+ }
+ 
++fn env_off(name: &str) -> bool {
++    matches!(
++        std::env::var(name).as_deref(),
++        Ok("off") | Ok("0") | Ok("false")
++    )
++}
++
++/// Terminal grid filling a `w` x `h` region at the top of the canvas.
++fn make_area(font: &font::Psf2Font, w: usize, h: usize) -> TermArea {
++    TermArea {
++        cols: w / font.width,
++        rows: h / font.height,
++        cw: font.width,
++        ch: font.height,
++        x0: (w % font.width) / 2,
++        y0: 0,
++    }
++}
++
++fn window_size(area: &TermArea) -> WindowSize {
++    WindowSize {
++        num_cols: area.cols as u16,
++        num_lines: area.rows as u16,
++        cell_width: area.cw as u16,
++        cell_height: area.ch as u16,
++    }
++}
++
+ fn main() {
+     if let Err(e) = run() {
+         eprintln!("paperterm: fatal: {e}");
+@@ -134,43 +228,54 @@ fn run() -> std::io::Result<()> {
+     };
+     let font = font::Psf2Font::parse(font_data).map_err(std::io::Error::other)?;
+ 
+-    // Geometry: terminal on top, OSK band at the bottom.
+-    let term_h = SCREEN_H - OSK_H;
+-    let area = TermArea {
+-        cols: SCREEN_W / font.width,
+-        rows: term_h / font.height,
+-        cw: font.width,
+-        ch: font.height,
+-        x0: (SCREEN_W % font.width) / 2,
+-        y0: 0,
+-    };
++    // PAPERTERM_OSK=off hides the on-screen keyboard and gives the whole
++    // screen to the terminal (use a physical keyboard). Rotation needs the
++    // keyboard hidden, since the keyboard layout is portrait-only.
++    let show_osk = !env_off("PAPERTERM_OSK");
++    let follow_rotation = !show_osk;
++    let swap_landscape = matches!(
++        std::env::var("PAPERTERM_ROTATE_SWAP").as_deref(),
++        Ok("1") | Ok("on") | Ok("true")
++    );
++    // AppLoad tells us the tablet's orientation right after we connect.
++    let mut rot = Rot(0);
++
++    let (lw, lh) = rot.logical_size(SCREEN_W, SCREEN_H);
++    render::set_canvas_size(lw, lh);
++    let term_h = if show_osk { lh - OSK_H } else { lh };
++    let mut area = make_area(&font, lw, term_h);
+     eprintln!(
+         "paperterm: starting, {}x{} cells, font {}x{}, key {}",
+         area.cols, area.rows, font.width, font.height, key
+     );
+ 
++    // We draw into this canvas and copy it to the shared framebuffer,
++    // rotated. Same byte size in every orientation.
++    let mut canvas = vec![0u8; SCREEN_W * SCREEN_H * 2];
++
+     // ---- qtfb ----
+-    let mut client = qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
++    let mut client =
++        qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
+     // Low-latency waveform for typing. NOTE: server stalls this connection 1s.
+     let _ = client.set_refresh_mode(qtfb::REFRESH_MODE_FAST);
+ 
+     // ---- terminal + pty ----
+     tty::setup_env();
+-    let size = GridSize { cols: area.cols, lines: area.rows };
++    let size = GridSize {
++        cols: area.cols,
++        lines: area.rows,
++    };
+     let (event_tx, event_rx) = mpsc::channel();
+     let mut term: Term<Listener> = Term::new(
+-        Config { scrolling_history: 5000, ..Config::default() },
++        Config {
++            scrolling_history: 5000,
++            ..Config::default()
++        },
+         &size,
+         Listener(event_tx),
+     );
+     let mut parser: Processor<StdSyncHandler> = Processor::new();
+ 
+-    let window_size = WindowSize {
+-        num_cols: area.cols as u16,
+-        num_lines: area.rows as u16,
+-        cell_width: font.width as u16,
+-        cell_height: font.height as u16,
+-    };
+     let mut env = std::collections::HashMap::new();
+     env.insert("TERM".into(), "xterm-256color".into());
+     env.insert("HOME".into(), "/home/root".into());
+@@ -185,36 +290,69 @@ fn run() -> std::io::Result<()> {
+         drain_on_exit: false,
+         env,
+     };
+-    let mut pty = tty::new(&pty_options, window_size, 0)?;
++    let mut pty = tty::new(&pty_options, window_size(&area), 0)?;
+ 
+     // ---- polling: key 0 = pty, key 1 = SIGCHLD pipe, key 2 = qtfb socket ----
+     let poller = Arc::new(Poller::new()?);
+     unsafe {
+         pty.register(&poller, PollEvent::readable(0), PollMode::Level)?;
+-        poller.add_with_mode(&FdSource(client.raw_fd()), PollEvent::readable(2), PollMode::Level)?;
++        poller.add_with_mode(
++            &FdSource(client.raw_fd()),
++            PollEvent::readable(2),
++            PollMode::Level,
++        )?;
+     }
+ 
+     let sigterm = Arc::new(AtomicBool::new(false));
+     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
+     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigterm))?;
+ 
++    // Physical keyboards (Bluetooth/USB), re-scanned for reconnects.
++    let mut keyboards = evkbd::Keyboards::new(!env_off("PAPERTERM_GRAB"));
++    let add_keyboards = |keyboards: &mut evkbd::Keyboards| -> std::io::Result<()> {
++        for fd in keyboards.scan() {
++            unsafe {
++                poller.add_with_mode(
++                    &FdSource(fd),
++                    PollEvent::readable(KBD_KEY_BASE + fd as usize),
++                    PollMode::Level,
++                )?;
++            }
++        }
++        Ok(())
++    };
++    add_keyboards(&mut keyboards)?;
++    let mut last_kbd_scan = Instant::now();
++
+     let palette = palette::Palette::new();
+-    let mut kbd = osk::Osk::new(term_h, OSK_H);
++    let mut kbd = show_osk.then(|| osk::Osk::new(term_h, OSK_H));
+ 
+     // Initial paint: white screen, keyboard, full update.
+-    render::fill_rect(client.framebuffer(), 0, 0, SCREEN_W, SCREEN_H, render::WHITE);
+-    {
+-        let fb = client.framebuffer();
+-        kbd.draw_all(fb, &font);
++    render::fill_rect(&mut canvas, 0, 0, lw, lh, render::WHITE);
++    if let Some(kbd) = kbd.as_ref() {
++        kbd.draw_all(&mut canvas, &font);
+     }
++    orient::blit(
++        &canvas,
++        lw,
++        client.framebuffer(),
++        SCREEN_W,
++        SCREEN_H,
++        rot,
++        (0, 0, lw, lh),
++    );
+     client.update_all()?;
+ 
+     let mut events = Events::with_capacity(NonZeroUsize::new(32).unwrap());
+     let mut buf = [0u8; 65536];
+     let mut activity = true; // force first render
++    let mut full_redraw = false; // repaint every row (after a rotation)
+     let mut dirty = DirtyRegion::default();
+     // Touch-drag scrolling state on the terminal area.
+     let mut drag: Option<(i32, i32)> = None; // (dev_id, last_y)
++                                             let mut pending_rot: Option<Rot> = None;
++    // What each cell looked like when last drawn (see render::cell_look).
++    let mut shadow = vec![u64::MAX; area.rows * area.cols];
+ 
+     'main: loop {
+         if sigterm.load(Ordering::Relaxed) {
+@@ -235,6 +373,9 @@ fn run() -> std::io::Result<()> {
+                     match pty.reader().read(&mut buf) {
+                         Ok(0) => break,
+                         Ok(n) => {
++                            if trace_on() {
++                                eprintln!("paperterm: trace pty {n}B t={}", now_ms());
++                            }
+                             parser.advance(&mut term, &buf[..n]);
+                             activity = true;
+                         }
+@@ -244,21 +385,56 @@ fn run() -> std::io::Result<()> {
+                     }
+                 },
+                 2 => {
+-                    let input = match client.drain_events() {
++                    let drained = match client.drain_events() {
+                         Ok(v) => v,
+                         Err(_) => break 'main, // window closed
+                     };
+-                    for iev in input {
++                    if let Some(r) = drained.rotation.filter(|_| follow_rotation) {
++                        eprintln!("paperterm: appload rotation {r}");
++                        pending_rot = Some(Rot::from_appload(r, swap_landscape));
++                    }
++                    for iev in drained.inputs {
+                         handle_input(
+-                            iev, &mut kbd, &mut client, &mut term, &mut pty, &font, &area,
+-                            &mut dirty, &mut drag, &mut activity,
++                            iev,
++                            rot,
++                            &mut kbd,
++                            &mut canvas,
++                            &mut client,
++                            &mut term,
++                            &mut pty,
++                            &font,
++                            &area,
++                            &mut dirty,
++                            &mut drag,
++                            &mut activity,
+                         )?;
+                     }
+                 }
++                k if k >= KBD_KEY_BASE => {
++                    let fd = (k - KBD_KEY_BASE) as RawFd;
++                    let (presses, gone) = keyboards.read(fd);
++                    for p in presses {
++                        let bytes = keys::encode(p.action, p.ctrl, p.alt, *term.mode());
++                        write_pty(&mut pty, &bytes)?;
++                        if term.grid().display_offset() != 0 {
++                            term.scroll_display(Scroll::Bottom);
++                            activity = true;
++                        }
++                    }
++                    if gone {
++                        let _ = poller.delete(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) });
++                        keyboards.remove(fd);
++                    }
++                }
+                 _ => {}
+             }
+         }
+ 
++        if last_kbd_scan.elapsed() >= KBD_SCAN {
++            last_kbd_scan = Instant::now();
++            add_keyboards(&mut keyboards)?;
++        }
++
+         // Term-emitted events (query replies etc.).
+         while let Ok(event) = event_rx.try_recv() {
+             match event {
+@@ -269,6 +445,29 @@ fn run() -> std::io::Result<()> {
+             }
+         }
+ 
++        // Follow the tablet's orientation: re-layout the grid for the new shape.
++        if let Some(new_rot) = pending_rot.take().filter(|r| *r != rot) {
++            rot = new_rot;
++            let (lw, lh) = rot.logical_size(SCREEN_W, SCREEN_H);
++            render::set_canvas_size(lw, lh);
++            area = make_area(&font, lw, lh);
++            term.resize(GridSize {
++                cols: area.cols,
++                lines: area.rows,
++            });
++            pty.on_resize(window_size(&area));
++            render::fill_rect(&mut canvas, 0, 0, lw, lh, render::WHITE);
++            dirty = DirtyRegion::default();
++            shadow = vec![u64::MAX; area.rows * area.cols];
++            drag = None;
++            full_redraw = true;
++            activity = true;
++            eprintln!(
++                "paperterm: rotation {} -> {}x{} cells",
++                rot.0, area.cols, area.rows
++            );
++        }
++
+         if activity {
+             activity = false;
+             let damage: Option<Vec<LineDamageBounds>> = match term.damage() {
+@@ -277,30 +476,59 @@ fn run() -> std::io::Result<()> {
+             };
+             term.reset_damage();
+ 
+-            let fb = client.framebuffer();
+-            match damage {
+-                None => {
+-                    for row in 0..area.rows {
+-                        render::draw_line(fb, &font, &palette, &term, &area, row, 0, area.cols - 1);
++            let lines: Vec<(usize, usize, usize)> = match damage.filter(|_| !full_redraw) {
++                None => (0..area.rows).map(|row| (row, 0, area.cols - 1)).collect(),
++                Some(lines) => lines
++                    .into_iter()
++                    .filter(|b| b.line < area.rows && b.left <= b.right)
++                    .map(|b| {
++                        (
++                            b.line,
++                            b.left.min(area.cols - 1),
++                            b.right.min(area.cols - 1),
++                        )
++                    })
++                    .collect(),
++            };
++            // Redraw only cells whose look actually changed. Terminal damage
++            // is coarse (often cursor..end of line); in landscape such a strip
++            // is a tall column on the panel and refreshes very slowly.
++            for (row, left, right) in lines {
++                let mut changed: Option<(usize, usize)> = None;
++                for col in left..=right {
++                    let look = render::cell_look(&term, &palette, row, col);
++                    let slot = &mut shadow[row * area.cols + col];
++                    if *slot != look {
++                        *slot = look;
++                        changed = Some(changed.map_or((col, col), |(a, _)| (a, col)));
+                     }
+-                    dirty.add(0, area.y0, SCREEN_W, area.rows * area.ch);
+                 }
+-                Some(lines) => {
+-                    for b in lines {
+-                        if b.line >= area.rows || b.left > b.right {
+-                            continue;
+-                        }
+-                        let left = b.left.min(area.cols - 1);
+-                        let right = b.right.min(area.cols - 1);
+-                        render::draw_line(fb, &font, &palette, &term, &area, b.line, left, right);
+-                        let (x, y, _, _) = area.cell_rect(left, b.line);
+-                        dirty.add(x, y, (right - left + 1) * area.cw, area.ch);
+-                    }
++                if let Some((a, b)) = changed {
++                    render::draw_line(&mut canvas, &font, &palette, &term, &area, row, a, b);
++                    let (x, y, _, _) = area.cell_rect(a, row);
++                    dirty.add(x, y, (b - a + 1) * area.cw, area.ch);
+                 }
+             }
+         }
+ 
+-        dirty.flush(&client);
++        if full_redraw {
++            // A rotation repaints everything: use a full, ghost-free refresh.
++            full_redraw = false;
++            let (lw, lh) = (render::canvas_w(), render::canvas_h());
++            dirty = DirtyRegion::default();
++            orient::blit(
++                &canvas,
++                lw,
++                client.framebuffer(),
++                SCREEN_W,
++                SCREEN_H,
++                rot,
++                (0, 0, lw, lh),
++            );
++            let _ = client.update_all();
++        } else {
++            dirty.flush(&canvas, &mut client, rot);
++        }
+     }
+ 
+     eprintln!("paperterm: exiting");
+@@ -311,7 +539,9 @@ fn run() -> std::io::Result<()> {
+ #[allow(clippy::too_many_arguments)]
+ fn handle_input(
+     ev: qtfb::InputEvent,
+-    kbd: &mut osk::Osk,
++    rot: Rot,
++    kbd: &mut Option<osk::Osk>,
++    canvas: &mut [u8],
+     client: &mut qtfb::QtfbClient,
+     term: &mut Term<Listener>,
+     pty: &mut tty::Pty,
+@@ -321,6 +551,8 @@ fn handle_input(
+     drag: &mut Option<(i32, i32)>,
+     activity: &mut bool,
+ ) -> std::io::Result<()> {
++    // Touch and pen positions arrive in physical screen coordinates.
++    let (x, y) = rot.to_logical(ev.x, ev.y, SCREEN_W, SCREEN_H);
+     match ev.input_type {
+         // AppLoad system virtual keyboard (if the user opens it): press only.
+         qtfb::INPUT_VKB_PRESS => {
+@@ -334,20 +566,17 @@ fn handle_input(
+             }
+         }
+         qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS => {
+-            if ev.y as usize >= kbd.y0 {
+-                let osk_events = {
+-                    let fb = client.framebuffer();
+-                    kbd.press(ev.dev_id, ev.x, ev.y, fb, font)
+-                };
++            if let Some(kbd) = kbd.as_mut().filter(|k| y as usize >= k.y0) {
++                let osk_events = kbd.press(ev.dev_id, x, y, canvas, font);
+                 process_osk_events(osk_events, client, term, pty, dirty, activity)?;
+             } else {
+-                *drag = Some((ev.dev_id, ev.y));
++                *drag = Some((ev.dev_id, y));
+             }
+         }
+         qtfb::INPUT_TOUCH_UPDATE => {
+             if let Some((id, last_y)) = *drag {
+                 if id == ev.dev_id {
+-                    let dy = ev.y - last_y;
++                    let dy = y - last_y;
+                     let lines = dy / area.ch as i32;
+                     if lines != 0 {
+                         // Drag down => view earlier history (positive Delta).
+@@ -362,11 +591,10 @@ fn handle_input(
+             if drag.map(|(id, _)| id) == Some(ev.dev_id) {
+                 *drag = None;
+             }
+-            let osk_events = {
+-                let fb = client.framebuffer();
+-                kbd.release(ev.dev_id, fb, font)
+-            };
+-            process_osk_events(osk_events, client, term, pty, dirty, activity)?;
++            if let Some(kbd) = kbd.as_mut() {
++                let osk_events = kbd.release(ev.dev_id, canvas, font);
++                process_osk_events(osk_events, client, term, pty, dirty, activity)?;
++            }
+         }
+         _ => {}
+     }
+diff --git a/src/qtfb.rs b/src/qtfb.rs
+index daf5665..d34c0e0 100644
+--- a/src/qtfb.rs
++++ b/src/qtfb.rs
+@@ -15,6 +15,9 @@ pub const MESSAGE_TERMINATE: u8 = 3;
+ pub const MESSAGE_USERINPUT: u8 = 4;
+ pub const MESSAGE_SET_REFRESH_MODE: u8 = 5;
+ pub const MESSAGE_REQUEST_FULL_REFRESH: u8 = 6;
++pub const MESSAGE_DEVICE_STATE_CHANGED: u8 = 7;
++pub const MESSAGE_DEVICE_STATE_INIT: u8 = 8;
++const STATE_CHANGED_REASON_ROTATION: i32 = 0;
+ 
+ pub const UPDATE_ALL: i32 = 0;
+ pub const UPDATE_PARTIAL: i32 = 1;
+@@ -209,10 +212,11 @@ impl QtfbClient {
+         let _ = self.send_msg(&msg);
+     }
+ 
+-    /// Drain pending server messages. Returns input events, or Err on
+-    /// disconnect (window closed -> we must exit).
+-    pub fn drain_events(&self) -> io::Result<Vec<InputEvent>> {
+-        let mut out = Vec::new();
++    /// Drain pending server messages: input events, plus the latest rotation
++    /// AppLoad reported (0 = none, 1 = 90 left, 2 = 90 right, 3 = 180), if
++    /// any. Err on disconnect (window closed -> we must exit).
++    pub fn drain_events(&self) -> io::Result<Drained> {
++        let mut out = Drained::default();
+         loop {
+             let mut buf = [0u8; 32];
+             let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, 32, 0) };
+@@ -232,8 +236,15 @@ impl QtfbClient {
+                 }
+                 return Err(e);
+             }
++            let is_state = buf[0] == MESSAGE_DEVICE_STATE_CHANGED || buf[0] == MESSAGE_DEVICE_STATE_INIT;
++            if is_state && n >= 16 {
++                let reason = i32::from_le_bytes(buf[8..12].try_into().unwrap());
++                if reason == STATE_CHANGED_REASON_ROTATION {
++                    out.rotation = Some(i32::from_le_bytes(buf[12..16].try_into().unwrap()));
++                }
++            }
+             if buf[0] == MESSAGE_USERINPUT && n >= 28 {
+-                out.push(InputEvent {
++                out.inputs.push(InputEvent {
+                     input_type: i32::from_le_bytes(buf[8..12].try_into().unwrap()),
+                     dev_id: i32::from_le_bytes(buf[12..16].try_into().unwrap()),
+                     x: i32::from_le_bytes(buf[16..20].try_into().unwrap()),
+@@ -245,6 +256,12 @@ impl QtfbClient {
+     }
+ }
+ 
++#[derive(Default)]
++pub struct Drained {
++    pub inputs: Vec<InputEvent>,
++    pub rotation: Option<i32>,
++}
++
+ impl Drop for QtfbClient {
+     fn drop(&mut self) {
+         self.terminate();
+diff --git a/src/render.rs b/src/render.rs
+index b5bcf1f..273d945 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -9,6 +9,29 @@ use alacritty_terminal::term::{Term, TermMode};
+ use alacritty_terminal::vte::ansi::Rgb;
+ 
+ pub const SCREEN_W: usize = 1620;
++pub const SCREEN_H: usize = 2160;
++
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++// Size of the logical canvas we draw into. It equals the physical screen in
++// portrait and is transposed in landscape; see orient.rs.
++static CANVAS_W: AtomicUsize = AtomicUsize::new(SCREEN_W);
++static CANVAS_H: AtomicUsize = AtomicUsize::new(SCREEN_H);
++
++pub fn set_canvas_size(w: usize, h: usize) {
++    CANVAS_W.store(w, Ordering::Relaxed);
++    CANVAS_H.store(h, Ordering::Relaxed);
++}
++
++#[inline]
++pub fn canvas_w() -> usize {
++    CANVAS_W.load(Ordering::Relaxed)
++}
++
++#[inline]
++pub fn canvas_h() -> usize {
++    CANVAS_H.load(Ordering::Relaxed)
++}
+ 
+ #[inline]
+ pub fn rgb565(c: Rgb) -> u16 {
+@@ -20,7 +43,7 @@ pub const BLACK: u16 = 0x0000;
+ 
+ #[inline]
+ fn put_px(fb: &mut [u8], x: usize, y: usize, c: u16) {
+-    let i = (y * SCREEN_W + x) * 2;
++    let i = (y * canvas_w() + x) * 2;
+     fb[i] = (c & 0xff) as u8;
+     fb[i + 1] = (c >> 8) as u8;
+ }
+@@ -28,9 +51,10 @@ fn put_px(fb: &mut [u8], x: usize, y: usize, c: u16) {
+ pub fn fill_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize, c: u16) {
+     let lo = (c & 0xff) as u8;
+     let hi = (c >> 8) as u8;
+-    for row in y..(y + h).min(2160) {
+-        let start = (row * SCREEN_W + x) * 2;
+-        let end = start + w.min(SCREEN_W - x) * 2;
++    let cw = canvas_w();
++    for row in y..(y + h).min(canvas_h()) {
++        let start = (row * cw + x) * 2;
++        let end = start + w.min(cw - x) * 2;
+         let slice = &mut fb[start..end];
+         for px in slice.chunks_exact_mut(2) {
+             px[0] = lo;
+@@ -40,9 +64,10 @@ pub fn fill_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize, c: u16)
+ }
+ 
+ pub fn invert_rect(fb: &mut [u8], x: usize, y: usize, w: usize, h: usize) {
+-    for row in y..(y + h).min(2160) {
+-        let start = (row * SCREEN_W + x) * 2;
+-        let end = start + w.min(SCREEN_W - x) * 2;
++    let cw = canvas_w();
++    for row in y..(y + h).min(canvas_h()) {
++        let start = (row * cw + x) * 2;
++        let end = start + w.min(cw - x) * 2;
+         for b in &mut fb[start..end] {
+             *b = !*b;
+         }
+@@ -79,7 +104,7 @@ pub fn draw_glyph(
+ pub fn draw_text(fb: &mut [u8], font: &Psf2Font, x: usize, y: usize, s: &str, fg: u16, bg: u16) {
+     let mut cx = x;
+     for c in s.chars() {
+-        if cx + font.width > SCREEN_W {
++        if cx + font.width > canvas_w() {
+             break;
+         }
+         draw_glyph(fb, font, cx, y, c, fg, bg, false);
+@@ -99,7 +124,12 @@ pub struct TermArea {
+ 
+ impl TermArea {
+     pub fn cell_rect(&self, col: usize, row: usize) -> (usize, usize, usize, usize) {
+-        (self.x0 + col * self.cw, self.y0 + row * self.ch, self.cw, self.ch)
++        (
++            self.x0 + col * self.cw,
++            self.y0 + row * self.ch,
++            self.cw,
++            self.ch,
++        )
+     }
+ }
+ 
+@@ -134,7 +164,11 @@ pub fn draw_line<T: EventListener>(
+         }
+         let fg565 = rgb565(fg);
+         let bg565 = rgb565(bg);
+-        let glyph_char = if cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
++        let glyph_char = if cell.flags.contains(Flags::HIDDEN) {
++            ' '
++        } else {
++            cell.c
++        };
+         let bold = cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD);
+         draw_glyph(fb, font, px, py, glyph_char, fg565, bg565, bold);
+         if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+@@ -156,3 +190,42 @@ pub fn draw_line<T: EventListener>(
+         }
+     }
+ }
++
++/// Fingerprint of how one cell currently looks on screen: glyph, colours,
++/// style and whether the cursor sits on it. Lets the caller skip cells that
++/// are already drawn correctly, keeping e-ink updates as small as possible.
++pub fn cell_look<T: EventListener>(
++    term: &Term<T>,
++    palette: &Palette,
++    row: usize,
++    col: usize,
++) -> u64 {
++    let display_offset = term.grid().display_offset();
++    let line = Line(row as i32 - display_offset as i32);
++    let colors = term.colors();
++    let cell = &term.grid()[line][Column(col)];
++    let mut fg = palette.resolve(cell.fg, colors);
++    let mut bg = palette.resolve(cell.bg, colors);
++    if cell.flags.contains(Flags::INVERSE) {
++        std::mem::swap(&mut fg, &mut bg);
++    }
++    let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
++    let c = if spacer || cell.flags.contains(Flags::HIDDEN) {
++        ' '
++    } else {
++        cell.c
++    };
++    let style = (cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD) as u64)
++        | (cell.flags.intersects(Flags::ALL_UNDERLINES) as u64) << 1
++        | (cell.flags.contains(Flags::STRIKEOUT) as u64) << 2
++        | (spacer as u64) << 3;
++    let cursor = term.mode().contains(TermMode::SHOW_CURSOR)
++        && display_offset == 0
++        && term.grid().cursor.point.line.0 as usize == row
++        && term.grid().cursor.point.column.0 == col;
++    (c as u64)
++        | (rgb565(fg) as u64) << 21
++        | (rgb565(bg) as u64) << 37
++        | style << 53
++        | (cursor as u64) << 60
++}

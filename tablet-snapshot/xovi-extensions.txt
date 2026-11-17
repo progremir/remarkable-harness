@@ -1,0 +1,10 @@
+appload.so
+framebuffer-spy.so
+qt-command-executor.so
+qt-resource-rebuilder.so
+rm-shot.so
+xovi-message-broker.so
+inactive: framebuffer-spy.so
+inactive: qt-command-executor.so
+inactive: webserver-remote.so
+inactive: xovi-message-broker.so

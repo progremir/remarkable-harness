@@ -1,0 +1,15 @@
+[package]
+name = "macview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Mac Screen viewer for the reMarkable Paper Pro: VNC over Tailscale with rotation and keyboard"
+
+[dependencies]
+libc = "0.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true
