@@ -18,8 +18,9 @@ install -m 644 external.manifest.json icon.png LICENSE.paperterm fonts/LICENSE.s
 ssh rm 'killall rexpaper 2>/dev/null; true'
 ../tools/push.sh "$STAGE" /home/root/xovi/exthome/appload
 rm -rf "$(dirname "$STAGE")"
-# Where the handwriting reader is on this Mac: the client starts it there.
-ssh rm "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$PWD/mac/scribe.py' > /home/root/.config/rexpaper/scribe"
+# Where the helper is on this Mac: the client starts it there, through Rex.
+# It reads handwriting and takes pictures of rexweb's browser panes.
+ssh rm "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$PWD/mac/helper.py' > /home/root/.config/rexpaper/helper && rm -f /home/root/.config/rexpaper/scribe"
 if [ -n "$1" ]; then
   ssh rm "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$1' > /home/root/.config/rexpaper/server && ls -ldn /home/root"
 fi

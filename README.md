@@ -124,6 +124,11 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - The reader keeps its last 20 pictures and a log of what it made of them in `~/.config/rexpaper/scribe/` on the Mac, to see why a reading went wrong.
   - A finger still scrolls and taps. The pen taps the key row, the bar and the menus.
   - Claude reads the ink on the Mac, through its Claude Code login, so `claude` must be installed there. It takes 3 to 5 seconds. `SCRIBE_MODEL` in the Mac's shell profile picks the model (default `sonnet`).
+- **Browser panes:** a [rexweb](https://github.com/acoyfellow/rexweb) pane shows on the tablet as a picture of its page, kept up to date.
+  - Tap to click. Drag to scroll; the page moves when the finger lifts.
+  - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
+  - The menu gains **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
+  - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane.
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
 - **Set-up:**
   - On the Mac, turn on Tailscale for the Rex server and read its name from `rex server status` (the `tailscale:` line).
@@ -135,7 +140,8 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Nothing in the pen's path waits for the server.
   - AppLoad has several ways to drive the e-ink, and the client picks one for the moment: a quick, clean one for text; the quickest one, which leaves ghosts, only while the pen is near and writing; and a slower one that leaves none for the update that takes ink away, and while the eraser is down.
   - That read races with the stream, so the client reads the screen once more when the terminal goes quiet.
-  - Handwriting goes through Rex too. The client starts `mac/scribe.py` in a terminal block of its own (`session.new_block`, labelled `rexpaper scribe`), types the strokes into it as a line of JSON, and reads the text off its screen when the block changes its title. No window shows that block, and it closes when the app does.
+  - Handwriting and browser panes go through Rex too. The client starts `mac/helper.py` in a terminal block of its own (`session.new_block`, labelled `rexpaper scribe`), types each request into it as a line of JSON, and reads the answer off its screen when the block changes its title. No window shows that block, and it closes when the app does.
+  - For a browser pane the helper asks rexweb's local API for a screenshot, turns it into a JPEG as wide as the tablet's pane, and the client downloads that file with `com.superlogical.terminal.download_begin`. Taps and typing become JavaScript that the helper runs in the page.
   - The output feeds the same emulator and e-ink renderer as PaperTerm. Keys go back with `com.superlogical.terminal.write`.
   - The server documents this protocol itself: `curl --unix-socket ~/Library/Application\ Support/rex/server.sock http://rex/llms.txt`.
 - **Size:** opening a tab claims its terminals (`session.own_block`) and sizes each one to its pane on the tablet. The Mac app then shows them at that size. When another device takes one back, the bar says so, and the tablet shows that terminal's left columns and last rows. Tap the bar to fit them to the tablet again. Leaving the tab hands them back.
@@ -143,7 +149,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
 - **Settings:** each is an environment variable in the app's `run.sh`, or a file of the same name, in lower case and without the prefix, in `/home/root/.config/rexpaper/`.
   - `REXPAPER_SERVER`: the server. `host[:port]` goes through `tailscale nc`, `tls://host[:port]` connects directly, `unix:/path` uses a local socket.
   - `REXPAPER_FONT`: `12x24`, `16x32` (default) or `32x64`. The menu writes this file.
-  - `REXPAPER_SCRIBE`: where `mac/scribe.py` is on the server's machine. `install.sh` writes this file.
+  - `REXPAPER_HELPER`: where `mac/helper.py` is on the server's machine. `install.sh` writes this file.
   - `REXPAPER_TRACE`: set it to log pen timings to `/tmp/rexpaper.log`: how late each touch was read, how soon its ink was sent to the screen, and any pass of the main loop that took over 25 ms.
   - `REXPAPER_KIND`: set it to `app` to receive the questions that actions in Rex's `init.lua` ask with `rex.ui`. The tablet then shows them and sends your answer. It is off by default, because the `rex` command picks "the app" by itself only while one app is connected. With the tablet as a second app, commands that act on a client need `-C`.
 - **Try it without the tablet:** `REXPAPER_HEADLESS=frame.raw` draws into a file that `tools/fb2png.py` turns into a PNG, and writes the focused terminal's text to `frame.raw.txt`. For example, on the Mac:
@@ -168,6 +174,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   | `REXPAPER_INJECT=<json>` | Handles a control message as if the server sent it. |
   | `REXPAPER_EXIT_AFTER=<seconds>` | Ends the run. |
 - **Limits:**
+  - Browser panes: clicks and keys are made in JavaScript, not by a real mouse and keyboard, so a page that checks for real input may ignore them. Pictures come every 6 seconds and after each thing you do, so video and animation don't play. Tested against a stand-in for rexweb, not rexweb itself.
   - Floating layers are not shown. The bar says how many a tab has.
   - A block that is not a terminal shows a few lines about itself instead of its content.
   - The picture of your handwriting goes to Claude.

@@ -43,6 +43,7 @@ mod rex;
 mod screen;
 mod stream;
 mod ui;
+mod web;
 mod wire;
 
 use std::collections::HashMap;
@@ -391,6 +392,8 @@ enum Body {
     Term(Box<TermView>),
     /// A block that isn't a terminal: a few lines about it.
     Info(Vec<String>),
+    /// A rexweb browser pane: pictures of its page.
+    Web(Box<web::WebView>),
 }
 
 struct Pane {
@@ -417,6 +420,8 @@ struct WinView {
     /// Dragging selects text instead of scrolling.
     select: bool,
     drag: Option<(i32, i32)>,
+    /// Where the finger went down, to tell a tap from a drag.
+    press: Option<(i32, i32)>,
     repaint: bool,
     /// The layout changed on the server: read it again.
     stale: bool,
@@ -451,6 +456,11 @@ enum Act {
     Font(i32),
     Refresh,
     Keyboard,
+    /// Go to an address in the browser pane; back, forward or reload.
+    WebGo,
+    WebNav(&'static str),
+    /// Open a browser pane beside this pane.
+    Browser,
     /// Answer a prompt that an action on the server raised.
     Reply(String),
 }
@@ -521,7 +531,6 @@ struct Ink {
     last_up: Option<Instant>,
     /// The request waiting for its text: id, and when it was sent.
     waiting: Option<(u64, Instant)>,
-    next_id: u64,
     /// The pen is pressing a button, not writing.
     tapping: Option<(i32, i32)>,
     /// The eraser is down: where it was last, the left and right ends of
@@ -548,9 +557,32 @@ struct Scribe {
     polling: Option<String>,
     /// It has said it is ready for requests.
     ready: bool,
-    /// A request written before it was ready.
-    queued: Option<String>,
+    /// Requests not yet written to it, and the write that is under way.
+    /// One write at a time, because the server may run two out of order.
+    queued: Vec<String>,
+    writing: Option<String>,
     polled: Instant,
+}
+
+/// What a request to the helper was for.
+enum Want {
+    Ink,
+    /// A picture of this browser pane's page.
+    Shot(String),
+    /// Something done to this browser pane: look at it again afterwards.
+    Act(String),
+    Open,
+}
+
+/// A picture of a page being downloaded.
+struct Fetch {
+    bid: String,
+    hash: String,
+    /// The request for the download's ticket, then the connection.
+    req: Option<String>,
+    wire: Option<Wire>,
+    welcomed: bool,
+    buf: Vec<u8>,
 }
 
 struct Retry {
@@ -600,6 +632,15 @@ struct App {
     scribe: Option<Scribe>,
     /// The pen is read from the digitizer, so AppLoad's copies are skipped.
     raw_pen: bool,
+    /// Requests the helper has not answered, by id, and what each is for.
+    wants: HashMap<u64, Want>,
+    /// Answers read since the last request: the next one tells the helper.
+    acks: Vec<u64>,
+    next_req: u64,
+    /// Pictures of pages on their way from the Mac.
+    fetches: Vec<Fetch>,
+    /// Keys typed into a browser pane and not sent yet: its block, the bytes.
+    web_keys: (String, Vec<u8>),
     /// Where ink was removed: this part of the screen is drawn again.
     repair: Option<Rect>,
     /// Where ink was removed and its ghost is still to be cleared: that
@@ -1040,7 +1081,7 @@ impl App {
                 self.scribe = None;
                 for (i, (sid, bid)) in scribes.into_iter().enumerate() {
                     if i == 0 {
-                        self.scribe = Some(Scribe { sid, bid, creating: None, polling: None, ready: true, queued: None, polled: Instant::now() });
+                        self.scribe = Some(Scribe { sid, bid, creating: None, polling: None, ready: true, queued: Vec::new(), writing: None, polled: Instant::now() });
                     } else {
                         self.send("block.close", json!({"session_id": sid, "block_id": bid}));
                     }
@@ -1133,6 +1174,7 @@ impl App {
         let r = inner(rect.unwrap_or(Rect::new(0, 0, g.lw, g.keys_y)), multi && rect.is_some());
         let (mut title, mut reopen) = (label.clone(), None);
         let body = match (creator.as_str(), self.ctl.as_mut()) {
+            (TERMINAL, _) if label == web::LABEL => Body::Web(Box::new(web::WebView::new())),
             (TERMINAL, Some(ctl)) => {
                 if let Some(t) = ctl
                     .terminal(&mut self.net, "title", sid, bid, json!({}))
@@ -1174,7 +1216,7 @@ impl App {
         let terms: Vec<&str> = info
             .panes
             .iter()
-            .filter(|p| p.2 == TERMINAL)
+            .filter(|p| p.2 == TERMINAL && p.3 != web::LABEL)
             .map(|p| p.0.as_str())
             .collect();
         if !terms.is_empty() {
@@ -1212,6 +1254,7 @@ impl App {
             zoom,
             select: false,
             drag: None,
+            press: None,
             repaint: true,
             stale: false,
             want_focus: None,
@@ -1282,7 +1325,7 @@ impl App {
         let new_terms: Vec<&str> = info
             .panes
             .iter()
-            .filter(|p| p.2 == TERMINAL && !old.contains_key(&p.0))
+            .filter(|p| p.2 == TERMINAL && p.3 != web::LABEL && !old.contains_key(&p.0))
             .map(|p| p.0.as_str())
             .collect();
         if !new_terms.is_empty() {
@@ -1334,6 +1377,11 @@ impl App {
         for (pane, rect) in wv.panes.iter_mut().zip(rects) {
             pane.rect = rect;
             pane.title_drawn.clear();
+            if let Body::Web(wb) = &mut pane.body {
+                wb.drawn = false;
+                wb.hash.clear();
+                wb.next_shot = Instant::now();
+            }
             let (Some(rect), Body::Term(tv)) = (rect, &mut pane.body) else {
                 continue;
             };
@@ -1398,7 +1446,7 @@ impl App {
         let pane = wv.panes.get_mut(wv.focus)?;
         match &mut pane.body {
             Body::Term(tv) => Some((tv, sid, pane.block_id.clone())),
-            Body::Info(_) => None,
+            Body::Info(_) | Body::Web(_) => None,
         }
     }
 
@@ -1426,6 +1474,16 @@ impl App {
     }
 
     fn type_bytes(&mut self, bytes: Vec<u8>) {
+        if let Some((bid, _)) = self.focused_web() {
+            // Sent together a moment later, as one request for a word
+            // rather than one for each letter.
+            if self.web_keys.0 != bid {
+                self.flush_web_keys();
+                self.web_keys.0 = bid;
+            }
+            self.web_keys.1.extend(bytes);
+            return;
+        }
         if let Some((tv, _, _)) = self.focused_term() {
             tv.pending.extend(bytes);
             tv.term.selection = None;
@@ -1460,8 +1518,10 @@ impl App {
         }
         match &self.view {
             View::Win(_) => {
-                let mode = match self.focused_term() {
-                    Some((tv, _, _)) => *tv.term.mode(),
+                let mode = self.focused_term().map(|(tv, _, _)| *tv.term.mode());
+                let mode = match mode {
+                    Some(mode) => mode,
+                    None if self.focused_web().is_some() => TermMode::empty(),
                     None => return,
                 };
                 self.type_bytes(keys::encode(action, ctrl, alt, mode));
@@ -1508,11 +1568,21 @@ impl App {
             return;
         };
         let it = |s: &str, a: Act| (s.to_string(), a);
-        let mut items = vec![
+        let mut items = Vec::new();
+        if matches!(wv.panes.get(wv.focus).map(|p| &p.body), Some(Body::Web(_))) {
+            items.extend([
+                it("Go to address", Act::WebGo),
+                it("Page back", Act::WebNav("back")),
+                it("Page forward", Act::WebNav("forward")),
+                it("Reload page", Act::WebNav("reload")),
+            ]);
+        }
+        items.extend([
             it("New tab", Act::NewTab(wv.session_id.clone())),
             it("Split right", Act::Split("horizontal")),
             it("Split down", Act::Split("vertical")),
-        ];
+            it("Open browser pane", Act::Browser),
+        ]);
         if wv.panes.len() > 1 {
             items.push(it(if wv.zoom { "Show all panes" } else { "Zoom this pane" }, Act::Zoom));
         }
@@ -1697,6 +1767,39 @@ impl App {
                     self.kbd = !self.kbd;
                     self.relayout();
                 }
+                (Act::WebGo, None) => {
+                    // The field starts empty: rubbing out an address on the
+                    // tablet is slower than writing a new one.
+                    let url = self.focused_web().map(|(_, wb)| wb.url.clone()).unwrap_or_default();
+                    self.ask(
+                        &format!("Go to (now at {})", clip(&url, 50)),
+                        AskKind::Text { value: String::new(), hint: "an address, or words to search for".to_string() },
+                        Act::WebGo,
+                    );
+                }
+                (Act::WebGo, Some(Answer::Text(url))) => {
+                    let bid = focus_bid.ok_or("no pane")?;
+                    self.web_act(&bid, json!({"web": "nav", "url": url}));
+                }
+                (Act::WebNav(op), _) => {
+                    let bid = focus_bid.ok_or("no pane")?;
+                    self.web_act(&bid, json!({"web": op}));
+                }
+                (Act::Browser, None) => self.ask(
+                    "Open a browser pane at",
+                    AskKind::Text { value: String::new(), hint: "an address, or words to search for".to_string() },
+                    Act::Browser,
+                ),
+                (Act::Browser, Some(Answer::Text(url))) => {
+                    let anchor = focus_bid.ok_or("no pane to put it beside")?;
+                    self.ask_helper(
+                        json!({"web": "open", "session": win_sid, "anchor": anchor, "url": url, "split": "right"}),
+                        Want::Open,
+                    )?;
+                    if let View::Win(wv) = &mut self.view {
+                        wv.zoom = false;
+                    }
+                }
                 (Act::Reply(call_id), Some(answer)) => {
                     let result = match answer {
                         Answer::Text(text) => json!({"text": text}),
@@ -1863,6 +1966,7 @@ impl App {
                         }
                     }
                     wv.drag = Some((ev.dev_id, y));
+                    wv.press = Some((x, y));
                     let select = wv.select;
                     if let Some(Pane { body: Body::Term(tv), .. }) = wv.panes.get_mut(wv.focus) {
                         tv.term.selection = select
@@ -1870,6 +1974,26 @@ impl App {
                     }
                 } else if wv.drag.is_some_and(|d| d.0 == ev.dev_id) {
                     let (id, last_y) = wv.drag.unwrap();
+                    let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+                    if let Some(Pane { body: Body::Web(wb), rect: Some(rect), block_id, .. }) = wv.panes.get(wv.focus) {
+                        // On a page a tap clicks, and a drag scrolls when the
+                        // finger lifts: e-ink can't follow a moving page.
+                        if release {
+                            let (x0, y0) = wv.press.unwrap_or((x, y));
+                            let bid = block_id.clone();
+                            let act = if (x - x0).abs() + (y - y0).abs() < 30 {
+                                wb.page_point(x0, y0, inner(*rect, multi))
+                                    .map(|(px, py)| json!({"web": "tap", "x": px, "y": py}))
+                            } else {
+                                Some(json!({"web": "scroll", "dy": (y0 - y) as f64 * wb.scale()}))
+                            };
+                            wv.drag = None;
+                            if let Some(act) = act {
+                                self.web_act(&bid, act);
+                            }
+                        }
+                        return;
+                    }
                     let select = wv.select;
                     let Some(Pane { body: Body::Term(tv), .. }) = wv.panes.get_mut(wv.focus) else {
                         return;
@@ -2167,7 +2291,7 @@ impl App {
     /// Start the handwriting reader in a terminal block of its own, in the
     /// open tab's session. No window shows it.
     fn start_scribe(&mut self) -> Result<(), String> {
-        let path = setting("scribe").ok_or("no reader is set up: run rexpaper/install.sh again")?;
+        let path = setting("helper").ok_or("no helper is set up: run rexpaper/install.sh again")?;
         let View::Win(wv) = &self.view else {
             return Err("open a tab first".into());
         };
@@ -2184,22 +2308,61 @@ impl App {
             creating: Some(id),
             polling: None,
             ready: false,
-            queued: None,
+            queued: Vec::new(), writing: None,
             polled: Instant::now(),
         });
         Ok(())
     }
 
+    /// Send a request to the helper on the Mac, starting it if need be.
+    /// Its answer comes to `helper_reply`.
+    fn ask_helper(&mut self, mut body: Value, want: Want) -> Result<u64, String> {
+        let here = match &self.view {
+            View::Win(wv) => wv.session_id.clone(),
+            _ => return Err("open a tab first".into()),
+        };
+        // The helper has to live in the open tab's session: only there can
+        // this client download the files it makes.
+        if let Some(sc) = self.scribe.take_if(|sc| sc.sid != here) {
+            if !sc.bid.is_empty() {
+                self.send("block.close", json!({"session_id": sc.sid, "block_id": sc.bid}));
+            }
+            self.wants.clear();
+        }
+        if self.scribe.is_none() {
+            self.start_scribe()?;
+        }
+        self.next_req += 1;
+        let id = self.next_req;
+        body["id"] = json!(id);
+        body["acks"] = json!(std::mem::take(&mut self.acks));
+        let line = format!("{body}\n");
+        self.wants.insert(id, want);
+        let Some(sc) = self.scribe.as_mut() else {
+            return Err("no helper".into());
+        };
+        sc.queued.push(line);
+        self.pump_helper();
+        Ok(id)
+    }
+
+    /// Write the waiting requests to the helper, if it is free to take them.
+    fn pump_helper(&mut self) {
+        let (Some(sc), Some(ctl)) = (self.scribe.as_mut(), self.ctl.as_mut()) else {
+            return;
+        };
+        if !sc.ready || sc.writing.is_some() || sc.queued.is_empty() {
+            return;
+        }
+        let data: String = std::mem::take(&mut sc.queued).concat();
+        sc.writing = Some(ctl.send(
+            &format!("{TERMINAL}.write"),
+            json!({"session_id": sc.sid, "block_id": sc.bid, "args": {"data": data}}),
+        ));
+    }
+
     /// The pen has rested: send what it wrote to be read.
     fn send_ink(&mut self) {
-        if self.scribe.is_none() {
-            if let Err(e) = self.start_scribe() {
-                self.clear_ink(true);
-                return self.say(&format!("Can't read handwriting: {e}"));
-            }
-        }
-        self.ink.next_id += 1;
-        let id = self.ink.next_id;
         let strokes: Vec<Vec<i32>> = self
             .ink
             .strokes
@@ -2217,23 +2380,18 @@ impl App {
             }
             None => String::new(),
         };
-        let line = format!("{}\n", json!({"id": id, "strokes": strokes, "before": before}));
-        self.ink.sent = std::mem::take(&mut self.ink.strokes);
-        self.ink.waiting = Some((id, Instant::now()));
-        let Some(sc) = self.scribe.as_mut() else {
-            return;
-        };
-        if sc.ready {
-            let (sid, bid) = (sc.sid.clone(), sc.bid.clone());
-            self.send(
-                &format!("{TERMINAL}.write"),
-                json!({"session_id": sid, "block_id": bid, "args": {"data": line}}),
-            );
-        } else {
-            sc.queued = Some(line);
+        match self.ask_helper(json!({"strokes": strokes, "before": before}), Want::Ink) {
+            Ok(id) => {
+                self.ink.sent = std::mem::take(&mut self.ink.strokes);
+                self.ink.waiting = Some((id, Instant::now()));
+                self.banner = Some(("Reading your handwriting...".to_string(), Instant::now()));
+                self.touch_chrome();
+            }
+            Err(e) => {
+                self.clear_ink(true);
+                self.say(&format!("Can't read handwriting: {e}"));
+            }
         }
-        self.banner = Some(("Reading your handwriting...".to_string(), Instant::now()));
-        self.touch_chrome();
     }
 
     /// Ask for the reader's screen. The answer comes to `scribe_screen`.
@@ -2253,9 +2411,20 @@ impl App {
         ));
     }
 
-    /// The reader could not be started or reached.
+    /// The helper could not be started or reached.
     fn scribe_lost(&mut self, why: &str) {
         self.scribe = None;
+        self.wants.clear();
+        self.fetches.clear();
+        if let View::Win(wv) = &mut self.view {
+            for p in wv.panes.iter_mut() {
+                if let Body::Web(wb) = &mut p.body {
+                    wb.busy = false;
+                    wb.error = Some(format!("The helper on the Mac stopped ({why})."));
+                    wb.drawn = false;
+                }
+            }
+        }
         if self.ink.waiting.is_some() {
             self.banner = None;
             self.clear_ink(false);
@@ -2263,47 +2432,238 @@ impl App {
         }
     }
 
-    /// What the reader has printed: type the text it found.
+    /// What the helper has printed: its answers to requests.
     fn scribe_screen(&mut self, screen: &str) {
-        let Some(sc) = self.scribe.as_ref() else {
+        let Some(sc) = self.scribe.as_mut() else {
             return;
         };
-        let (sid, bid) = (sc.sid.clone(), sc.bid.clone());
         let mut replies = Vec::new();
         for part in screen.split("@@scribe ").skip(1) {
             if let Some(v) = part.split("@@").next().and_then(|j| serde_json::from_str::<Value>(j).ok()) {
                 replies.push(v);
             }
         }
-        let mut queued = None;
-        if let Some(sc) = self.scribe.as_mut() {
-            if !sc.ready && replies.iter().any(|r| r["ready"] == 1) {
-                sc.ready = true;
-                queued = sc.queued.take();
+        if !sc.ready && replies.iter().any(|r| r["ready"] == 1) {
+            sc.ready = true;
+            self.acks.push(0);
+            self.pump_helper();
+        }
+        for reply in replies {
+            let Some(id) = reply["id"].as_u64() else {
+                continue;
+            };
+            if let Some(want) = self.wants.remove(&id) {
+                self.acks.push(id);
+                self.helper_reply(id, want, &reply);
             }
         }
-        if let Some(line) = queued {
-            self.send(
-                &format!("{TERMINAL}.write"),
-                json!({"session_id": sid, "block_id": bid, "args": {"data": line}}),
-            );
+    }
+
+    fn helper_reply(&mut self, id: u64, want: Want, reply: &Value) {
+        let error = reply["error"].as_str().map(str::to_string);
+        match want {
+            Want::Ink => {
+                if self.ink.waiting.map(|w| w.0) != Some(id) {
+                    return; // rubbed out while it was being read
+                }
+                self.banner = None;
+                self.clear_ink(false);
+                match (reply["text"].as_str(), error) {
+                    (Some(text), _) if !text.is_empty() => self.type_bytes(text.as_bytes().to_vec()),
+                    (_, Some(e)) => self.say(&format!("Couldn't read the handwriting: {e}")),
+                    _ => self.say("Couldn't read that. Try writing it again."),
+                }
+                self.touch_chrome();
+            }
+            Want::Shot(bid) => {
+                let View::Win(wv) = &mut self.view else {
+                    return;
+                };
+                let Some(pane) = wv.panes.iter_mut().find(|p| p.block_id == bid) else {
+                    return;
+                };
+                let Body::Web(wb) = &mut pane.body else {
+                    return;
+                };
+                wb.busy = false;
+                if let Some(e) = error {
+                    if wb.error.as_deref() != Some(e.as_str()) {
+                        wb.error = Some(e);
+                        wb.drawn = false;
+                    }
+                    wb.next_shot = Instant::now() + Duration::from_secs(5);
+                    return;
+                }
+                wb.error = None;
+                wb.vw = reply["vw"].as_f64().unwrap_or(0.0);
+                wb.vh = reply["vh"].as_f64().unwrap_or(0.0);
+                wb.edit = reply["edit"].as_bool().unwrap_or(false);
+                wb.url = reply["url"].as_str().unwrap_or("").to_string();
+                let title = reply["title"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or(&wb.url).to_string();
+                if title != pane.title {
+                    wb.title = title.clone();
+                    pane.title = title;
+                    wv.chrome.clear();
+                }
+                // Look again soon while the page is still loading, and now
+                // and then otherwise: pages change by themselves.
+                let loading = reply["loading"].as_bool().unwrap_or(false);
+                wb.next_shot = Instant::now() + Duration::from_secs(if loading { 1 } else { 6 });
+                let (Some(path), Some(hash)) = (reply["path"].as_str(), reply["hash"].as_str()) else {
+                    return; // the same picture as before
+                };
+                wb.busy = true;
+                let (path, hash) = (path.to_string(), hash.to_string());
+                self.fetch(bid, path, hash);
+            }
+            Want::Act(bid) => {
+                if let Some(e) = error {
+                    self.say(&format!("The page didn't take that: {e}"));
+                }
+                if let View::Win(wv) = &mut self.view {
+                    if let Some(Pane { body: Body::Web(wb), .. }) = wv.panes.iter_mut().find(|p| p.block_id == bid) {
+                        wb.next_shot = Instant::now();
+                    }
+                }
+            }
+            Want::Open => {
+                if let Some(e) = error {
+                    self.say(&format!("Couldn't open a browser pane: {e}"));
+                }
+            }
         }
-        let Some((id, _)) = self.ink.waiting else {
+    }
+
+    // ------------------------------------------------------ browser panes
+
+    /// Start downloading a picture of a page from the helper's machine.
+    fn fetch(&mut self, bid: String, path: String, hash: String) {
+        let (Some(sc), Some(ctl)) = (self.scribe.as_ref(), self.ctl.as_mut()) else {
             return;
         };
-        let Some(reply) = replies.iter().find(|r| r["id"].as_u64() == Some(id)) else {
+        let mut r = [0u8; 16];
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = std::io::Read::read_exact(&mut f, &mut r);
+        }
+        r[6] = (r[6] & 0x0f) | 0x40;
+        r[8] = (r[8] & 0x3f) | 0x80;
+        let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+        let uuid = format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]);
+        let req = ctl.send(
+            &format!("{TERMINAL}.download_begin"),
+            json!({"session_id": sc.sid, "block_id": sc.bid,
+                   "args": {"ref": format!("download:{uuid}"), "path": path}}),
+        );
+        self.fetches.retain(|f| f.bid != bid);
+        self.fetches.push(Fetch { bid, hash, req: Some(req), wire: None, welcomed: false, buf: Vec::new() });
+    }
+
+    /// The download finished, or failed: show the picture.
+    fn fetched(&mut self, f: Fetch, failed: Option<String>) {
+        let View::Win(wv) = &mut self.view else {
             return;
         };
-        self.banner = None;
-        self.clear_ink(false);
-        // Old replies would otherwise pile up on the reader's screen.
-        self.send(&format!("{TERMINAL}.clear"), json!({"session_id": sid, "block_id": bid, "args": {}}));
-        match (reply["text"].as_str(), reply["error"].as_str()) {
-            (Some(text), _) if !text.is_empty() => self.type_bytes(text.as_bytes().to_vec()),
-            (_, Some(e)) => self.say(&format!("Couldn't read the handwriting: {e}")),
-            _ => self.say("Couldn't read that. Try writing it again."),
+        let Some(Pane { body: Body::Web(wb), .. }) = wv.panes.iter_mut().find(|p| p.block_id == f.bid) else {
+            return;
+        };
+        wb.busy = false;
+        let done = match failed {
+            Some(e) => Err(e),
+            None => wb.set_jpeg(&f.buf),
+        };
+        match done {
+            Ok(()) => wb.hash = f.hash,
+            Err(e) => {
+                eprintln!("rexpaper: picture of {}: {e}", f.bid);
+                wb.next_shot = Instant::now() + Duration::from_secs(3);
+            }
         }
-        self.touch_chrome();
+    }
+
+    fn web_pane(&mut self, bid: &str) -> Option<(usize, &mut web::WebView)> {
+        let View::Win(wv) = &mut self.view else {
+            return None;
+        };
+        let i = wv.panes.iter().position(|p| p.block_id == bid)?;
+        match &mut wv.panes[i].body {
+            Body::Web(wb) => Some((i, wb)),
+            _ => None,
+        }
+    }
+
+    /// The focused pane, if it is a browser pane: its block and view.
+    fn focused_web(&mut self) -> Option<(String, &mut web::WebView)> {
+        let View::Win(wv) = &mut self.view else {
+            return None;
+        };
+        let pane = wv.panes.get_mut(wv.focus)?;
+        match &mut pane.body {
+            Body::Web(wb) => Some((pane.block_id.clone(), wb)),
+            _ => None,
+        }
+    }
+
+    fn flush_web_keys(&mut self) {
+        let (bid, bytes) = std::mem::take(&mut self.web_keys);
+        if !bytes.is_empty() {
+            self.web_type(&bid, &bytes);
+        }
+    }
+
+    /// Do something to a browser pane's page.
+    fn web_act(&mut self, bid: &str, mut body: Value) {
+        body["block"] = json!(bid);
+        if let Err(e) = self.ask_helper(body, Want::Act(bid.to_string())) {
+            self.say(&format!("Can't reach the page: {e}"));
+        }
+    }
+
+    /// Text and keys for a browser pane, as the bytes a terminal would get.
+    fn web_type(&mut self, bid: &str, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes).to_string();
+        let mut run = String::new();
+        let send = |app: &mut App, run: &mut String| {
+            if !run.is_empty() {
+                app.web_act(bid, json!({"web": "text", "text": std::mem::take(run)}));
+            }
+        };
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            let key = match c {
+                '\r' | '\n' => "enter",
+                '\x7f' | '\x08' => "backspace",
+                '\t' => "tab",
+                '\x1b' => {
+                    // An arrow or paging key, as a terminal escape sequence.
+                    let mut seq = String::new();
+                    while let Some(&n) = chars.peek() {
+                        seq.push(n);
+                        chars.next();
+                        if n.is_ascii_alphabetic() || n == '~' {
+                            break;
+                        }
+                    }
+                    match seq.as_str() {
+                        "" => "escape",
+                        "[A" | "OA" => "up",
+                        "[B" | "OB" => "down",
+                        "[C" | "OC" => "right",
+                        "[D" | "OD" => "left",
+                        "[5~" => "pageup",
+                        "[6~" => "pagedown",
+                        _ => continue,
+                    }
+                }
+                c if c.is_control() => continue,
+                c => {
+                    run.push(c);
+                    continue;
+                }
+            };
+            send(self, &mut run);
+            self.web_act(bid, json!({"web": "key", "key": key}));
+        }
+        send(self, &mut run);
     }
 
     /// The screen turned: lay everything out for the new shape.
@@ -2417,7 +2777,30 @@ impl App {
         if v["type"] == "response" {
             let id = v["id"].as_str();
             let failed = v.get("error").filter(|e| !e.is_null()).map(|e| e["message"].as_str().unwrap_or("failed").to_string());
+            if let Some(i) = self.fetches.iter().position(|f| f.req.as_deref() == id && id.is_some()) {
+                let ticket = v["payload"]["ticket"].as_str().and_then(wire::b64url_decode).filter(|t| t.len() == 16);
+                match ticket {
+                    Some(ticket) => {
+                        let data = self.net.open("/api/data", "rex.data.bytes.v1");
+                        let mut hello = vec![0x01];
+                        hello.extend_from_slice(&ticket);
+                        data.send(Out::Binary(hello));
+                        self.fetches[i].req = None;
+                        self.fetches[i].wire = Some(data);
+                    }
+                    None => {
+                        let f = self.fetches.remove(i);
+                        self.fetched(f, Some(failed.unwrap_or_else(|| "no download ticket".to_string())));
+                    }
+                }
+                return;
+            }
             if let Some(sc) = self.scribe.as_mut() {
+                if sc.writing.as_deref() == id && id.is_some() {
+                    sc.writing = None;
+                    self.pump_helper();
+                    return;
+                }
                 if sc.creating.as_deref() == id && id.is_some() {
                     sc.creating = None;
                     match (failed, v["payload"]["block_id"].as_str()) {
@@ -2540,6 +2923,27 @@ impl App {
             }
             return;
         }
+        if let Some(i) = self.fetches.iter().position(|f| f.wire.as_ref().is_some_and(|w| w.id == id)) {
+            match msg {
+                In::Binary(b) if !self.fetches[i].welcomed => {
+                    if b.first() == Some(&0x81) {
+                        self.fetches[i].welcomed = true;
+                    } else {
+                        let f = self.fetches.remove(i);
+                        self.fetched(f, Some("the download was refused".to_string()));
+                    }
+                }
+                In::Binary(b) => self.fetches[i].buf.extend_from_slice(&b),
+                In::Closed(_) => {
+                    // The stream closes when the whole file has come.
+                    let f = self.fetches.remove(i);
+                    let failed = f.buf.is_empty().then(|| "nothing came".to_string());
+                    self.fetched(f, failed);
+                }
+                In::Text(_) => {}
+            }
+            return;
+        }
         let View::Win(wv) = &mut self.view else {
             return;
         };
@@ -2580,9 +2984,32 @@ impl App {
                 self.clear_ink(true);
             }
         }
+        self.flush_web_keys();
+        // Pictures of the browser panes on screen that are due for one.
+        let mut shots = Vec::new();
+        if let (View::Win(wv), None) = (&mut self.view, &self.overlay) {
+            let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+            for p in wv.panes.iter_mut() {
+                if let (Some(rect), Body::Web(wb)) = (p.rect, &mut p.body) {
+                    if !wb.busy && Instant::now() >= wb.next_shot {
+                        wb.busy = true;
+                        wb.next_shot = Instant::now() + Duration::from_secs(20);
+                        shots.push((p.block_id.clone(), inner(rect, multi).w, wb.hash.clone()));
+                    }
+                }
+            }
+        }
+        for (bid, w, last) in shots {
+            let asked = self.ask_helper(json!({"web": "shot", "block": bid, "w": w, "last": last}), Want::Shot(bid.clone()));
+            if let (Err(e), Some((_, wb))) = (asked, self.web_pane(&bid)) {
+                wb.busy = false;
+                wb.error = Some(format!("Can't show this page: {e}"));
+                wb.drawn = false;
+            }
+        }
         // The title change that announces a reply can be missed: look anyway.
         let due = self.scribe.as_ref().is_some_and(|sc| {
-            (self.ink.waiting.is_some() || !sc.ready) && sc.polled.elapsed() >= Duration::from_millis(2500)
+            (!self.wants.is_empty() || !sc.ready) && sc.polled.elapsed() >= Duration::from_millis(2500)
         });
         if due {
             self.poll_scribe();
@@ -2625,6 +3052,7 @@ impl App {
                         // "4000 block closed": the terminal is gone for good.
                         Body::Term(tv) => tv.stream_closed.as_ref().is_some_and(|w| !w.starts_with("4000")),
                         Body::Info(_) => true,
+                        Body::Web(_) => false,
                     };
                     let Some((at, tries)) = pane.reopen.filter(|(at, _)| dropped && now >= *at) else {
                         continue;
@@ -2850,6 +3278,13 @@ impl App {
                     }
                 }
                 Body::Info(_) => {}
+                Body::Web(wb) => {
+                    if redo || !wb.drawn {
+                        let r = inner(rect, multi);
+                        wb.draw(&mut self.canvas, &self.ui, r);
+                        self.dirty.add_rect(r);
+                    }
+                }
             }
         }
 
@@ -3167,6 +3602,11 @@ fn run() -> std::io::Result<()> {
         ink: Ink::default(),
         scribe: None,
         raw_pen: false,
+        wants: HashMap::new(),
+        acks: Vec::new(),
+        next_req: 0,
+        fetches: Vec::new(),
+        web_keys: (String::new(), Vec::new()),
         repair: None,
         flash: None,
         trace: setting("trace").is_some(),
