@@ -1,8 +1,8 @@
 diff --git a/Sources/RexWeb.swift b/Sources/RexWeb.swift
-index 74497c2..275fe7f 100644
+index 74497c2..9405491 100644
 --- a/Sources/RexWeb.swift
 +++ b/Sources/RexWeb.swift
-@@ -821,17 +821,26 @@ final class Tracker {
+@@ -821,17 +821,29 @@ final class Tracker {
    func window(for p: Panel, _ place: (rect: CGRect, floating: Bool), _ v: [String: Any], _ rexWins: [RexWindow], _ primaryHeight: CGFloat) -> RexWindow? {
      let label = v["label"] as? String ?? ""
      if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
@@ -14,7 +14,7 @@ index 74497c2..275fe7f 100644
 -    return ranked[1].1 - ranked[0].1 > 2 ? ranked[0].0 : nil
 +    // Local addition: a Rex window that isn't a session's, such as Settings,
 +    // can be the front one and get paired with the session. The pane's
-+    // terminal grid tells them apart: it only fits the window it was sized in.
++    // terminal grid tells them apart: it fits the window it was sized in best.
 +    guard let g = grids[p.id] else {
 +      if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
 +      let free = rexWins.filter { windowSession[$0.number] == nil }
@@ -25,17 +25,20 @@ index 74497c2..275fe7f 100644
        let s = Tracker.scale(at: w.bounds, primaryHeight: primaryHeight)
        return abs(body.width - g.columns * g.cellWidth / s) + abs(body.height - g.rows * g.cellHeight / s)
      }
-+    let fits = rexWins.filter { score($0) < 60 }
-+    if let w = fits.first(where: { windowSession[$0.number] == p.session }) { return w }
-+    let free = fits.filter { windowSession[$0.number] == nil }
-+    if free.count == 1 { return free[0] }
++    // The session's own window wins unless another fits far better. An exact
++    // fit can't be asked for: Rex's sidebar narrows a pane without telling us.
++    let pool = rexWins.filter { windowSession[$0.number] == nil || windowSession[$0.number] == p.session }
++    let ranked = pool.map { ($0, score($0)) }.sorted { $0.1 < $1.1 }
++    guard let best = ranked.first else { return nil }
++    if let mine = ranked.first(where: { windowSession[$0.0.number] == p.session }), mine.1 <= best.1 + 100 { return mine.0 }
++    let free = ranked.filter { windowSession[$0.0.number] == nil }
++    if free.count == 1 { return free[0].0 }
 +    guard free.count > 1 else { return nil }
-+    let ranked = free.map { ($0, score($0)) }.sorted { $0.1 < $1.1 }
-+    return ranked[1].1 - ranked[0].1 > 2 ? ranked[0].0 : nil
++    return free[1].1 - free[0].1 > 2 ? free[0].0 : nil
    }
  
    static func body(_ frac: CGRect, floating: Bool, in b: CGRect, _ ins: Insets) -> (body: CGRect, radius: Double) {
-@@ -1313,6 +1322,20 @@ final class App: NSObject, NSApplicationDelegate {
+@@ -1313,6 +1325,20 @@ final class App: NSObject, NSApplicationDelegate {
      switch route {
      case "/info":
        ok(p.info())
