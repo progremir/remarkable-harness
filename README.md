@@ -127,7 +127,8 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
 - **Browser panes:** a [rexweb](https://github.com/acoyfellow/rexweb) pane shows on the tablet as a picture of its page, kept up to date.
   - Tap to click. Drag to scroll; the page moves when the finger lifts.
   - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
-  - The menu gains **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
+  - A bar above the page has back, forward and reload buttons and the address. Tap the address to go somewhere else.
+  - The menu has the same four as **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
   - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane. A pane in a tab that Rex on the Mac isn't showing keeps rexweb's default size, 800 by 540: wide and short, so it fills only the top of a tall pane.
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
 - **Set-up:**

@@ -1990,15 +1990,24 @@ impl App {
                         if release {
                             let (x0, y0) = wv.press.unwrap_or((x, y));
                             let bid = block_id.clone();
-                            let act = if (x - x0).abs() + (y - y0).abs() < 30 {
-                                wb.page_point(x0, y0, inner(*rect, multi))
-                                    .map(|(px, py)| json!({"web": "tap", "x": px, "y": py}))
-                            } else {
-                                Some(json!({"web": "scroll", "dy": (y0 - y) as f64 * wb.scale()}))
+                            let area = inner(*rect, multi);
+                            let tap = (x - x0).abs() + (y - y0).abs() < 30;
+                            let bar = if tap { web::bar_hit(x0, y0, area) } else { None };
+                            let act = match bar {
+                                Some(web::BarHit::Back) => Some(json!({"web": "back"})),
+                                Some(web::BarHit::Forward) => Some(json!({"web": "forward"})),
+                                Some(web::BarHit::Reload) => Some(json!({"web": "reload"})),
+                                Some(web::BarHit::Address) => None,
+                                None if tap => wb
+                                    .page_point(x0, y0, web::page_rect(area))
+                                    .map(|(px, py)| json!({"web": "tap", "x": px, "y": py})),
+                                None => Some(json!({"web": "scroll", "dy": (y0 - y) as f64 * wb.scale()})),
                             };
                             wv.drag = None;
                             if let Some(act) = act {
                                 self.web_act(&bid, act);
+                            } else if bar == Some(web::BarHit::Address) {
+                                self.perform(Act::WebGo, None);
                             }
                         }
                         return;
@@ -2507,7 +2516,11 @@ impl App {
                 wb.vw = reply["vw"].as_f64().unwrap_or(0.0);
                 wb.vh = reply["vh"].as_f64().unwrap_or(0.0);
                 wb.edit = reply["edit"].as_bool().unwrap_or(false);
-                wb.url = reply["url"].as_str().unwrap_or("").to_string();
+                let url = reply["url"].as_str().unwrap_or("").to_string();
+                if url != wb.url {
+                    wb.url = url;
+                    wb.drawn = false;
+                }
                 let title = reply["title"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or(&wb.url).to_string();
                 if title != pane.title {
                     wb.title = title.clone();

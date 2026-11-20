@@ -14,6 +14,40 @@ pub const LABEL: &str = "browser";
 /// What the terminal under a rexweb pane shows: "rexweb · " and the address.
 pub const SCREEN: &str = "rexweb \u{b7}";
 
+/// Height of the bar above the page: back, forward, reload and the address.
+pub const BAR_H: usize = 60;
+const BTN_W: usize = 84;
+const RELOAD_W: usize = 124;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BarHit {
+    Back,
+    Forward,
+    Reload,
+    Address,
+}
+
+/// The part of a browser pane that shows the page.
+pub fn page_rect(r: Rect) -> Rect {
+    Rect::new(r.x, r.y + BAR_H, r.w, r.h.saturating_sub(BAR_H))
+}
+
+fn bar_parts(r: Rect) -> [(BarHit, Rect); 4] {
+    let h = BAR_H - 2;
+    let left = 2 * BTN_W + RELOAD_W;
+    [
+        (BarHit::Back, Rect::new(r.x, r.y, BTN_W, h)),
+        (BarHit::Forward, Rect::new(r.x + BTN_W, r.y, BTN_W, h)),
+        (BarHit::Reload, Rect::new(r.x + 2 * BTN_W, r.y, RELOAD_W, h)),
+        (BarHit::Address, Rect::new(r.x + left, r.y, r.w.saturating_sub(left), h)),
+    ]
+}
+
+/// What part of the bar a point of the canvas is on.
+pub fn bar_hit(x: i32, y: i32, r: Rect) -> Option<BarHit> {
+    bar_parts(r).iter().find(|(_, b)| b.has(x, y)).map(|(hit, _)| *hit)
+}
+
 pub struct WebView {
     /// The page as last seen: RGB565, `iw` x `ih`.
     img: Vec<u8>,
@@ -100,6 +134,20 @@ impl WebView {
     pub fn draw(&mut self, fb: &mut [u8], font: &Psf2Font, r: Rect) {
         self.drawn = true;
         render::fill_rect(fb, r.x, r.y, r.w, r.h, WHITE);
+        for (hit, b) in bar_parts(r) {
+            match hit {
+                BarHit::Back => ui::button(fb, font, b, "\u{2190}", false),
+                BarHit::Forward => ui::button(fb, font, b, "\u{2192}", false),
+                BarHit::Reload => ui::button(fb, font, b, "Reload", false),
+                BarHit::Address => {
+                    let text = if self.url.is_empty() { "Tap to enter an address" } else { &self.url };
+                    ui::line(fb, font, b, text, false);
+                    ui::outline(fb, b, 2, BLACK);
+                }
+            }
+        }
+        render::fill_rect(fb, r.x, r.y + BAR_H - 2, r.w, 2, BLACK);
+        let r = page_rect(r);
         if self.img.is_empty() {
             let text = match &self.error {
                 Some(e) => e.clone(),
