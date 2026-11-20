@@ -1,0 +1,58 @@
+diff --git a/Sources/RexWeb.swift b/Sources/RexWeb.swift
+index 74497c2..275fe7f 100644
+--- a/Sources/RexWeb.swift
++++ b/Sources/RexWeb.swift
+@@ -821,17 +821,26 @@ final class Tracker {
+   func window(for p: Panel, _ place: (rect: CGRect, floating: Bool), _ v: [String: Any], _ rexWins: [RexWindow], _ primaryHeight: CGFloat) -> RexWindow? {
+     let label = v["label"] as? String ?? ""
+     if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
+-    if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
+-    let free = rexWins.filter { windowSession[$0.number] == nil }
+-    if free.count == 1 { return free[0] }
+-    guard free.count > 1, let g = grids[p.id] else { return nil }
+-    let ranked = free.map { ($0, score($0)) }.sorted { $0.1 < $1.1 }
+-    return ranked[1].1 - ranked[0].1 > 2 ? ranked[0].0 : nil
++    // Local addition: a Rex window that isn't a session's, such as Settings,
++    // can be the front one and get paired with the session. The pane's
++    // terminal grid tells them apart: it only fits the window it was sized in.
++    guard let g = grids[p.id] else {
++      if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
++      let free = rexWins.filter { windowSession[$0.number] == nil }
++      return free.count == 1 ? free[0] : nil
++    }
+     func score(_ w: RexWindow) -> Double {
+       let body = Tracker.body(place.rect, floating: place.floating, in: w.bounds, insets).body
+       let s = Tracker.scale(at: w.bounds, primaryHeight: primaryHeight)
+       return abs(body.width - g.columns * g.cellWidth / s) + abs(body.height - g.rows * g.cellHeight / s)
+     }
++    let fits = rexWins.filter { score($0) < 60 }
++    if let w = fits.first(where: { windowSession[$0.number] == p.session }) { return w }
++    let free = fits.filter { windowSession[$0.number] == nil }
++    if free.count == 1 { return free[0] }
++    guard free.count > 1 else { return nil }
++    let ranked = free.map { ($0, score($0)) }.sorted { $0.1 < $1.1 }
++    return ranked[1].1 - ranked[0].1 > 2 ? ranked[0].0 : nil
+   }
+ 
+   static func body(_ frac: CGRect, floating: Bool, in b: CGRect, _ ins: Insets) -> (body: CGRect, radius: Double) {
+@@ -1313,6 +1322,20 @@ final class App: NSObject, NSApplicationDelegate {
+     switch route {
+     case "/info":
+       ok(p.info())
++    case "/size":
++      // Local addition for the reMarkable Rex client (rexpaper): lay out a
++      // pane that Rex isn't showing on this Mac at the size the client shows
++      // it. A pane on screen keeps following Rex.
++      guard !p.visible else { return ok(["sized": false]) }
++      let w = (input["width"] as? NSNumber)?.doubleValue ?? 0, h = (input["height"] as? NSNumber)?.doubleValue ?? 0
++      guard w >= 100, h >= 100, w <= 4000, h <= 4000 else { return fail("width and height must be 100 to 4000") }
++      let size = NSSize(width: w, height: h + Double(Panel.barHeight))
++      if p.window.frame.size != size {
++        p.window.setContentSize(size)
++        p.lastFrame = .zero
++        p.layout()
++      }
++      ok(["sized": true])
+     case "/loaded":
+       var replied = false
+       let timeout = (input["timeout"] as? NSNumber)?.doubleValue ?? 30
