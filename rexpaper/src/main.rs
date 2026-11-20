@@ -461,7 +461,7 @@ enum Act {
     WebNav(&'static str),
     WebZoom(i32),
     /// Open a browser pane beside this pane.
-    Browser,
+    Browser(bool),
     /// Answer a prompt that an action on the server raised.
     Reply(String),
 }
@@ -573,6 +573,8 @@ enum Want {
     /// Something done to this browser pane: look at it again afterwards.
     Act(String),
     Open,
+    /// A browser pane opened in a new tab of this session: show that tab.
+    OpenTab(String),
 }
 
 /// A picture of a page being downloaded.
@@ -599,7 +601,7 @@ struct App {
     rot: Rot,
     fonts: Vec<Psf2Font>,
     font_ix: usize,
-    /// How much bigger than on the Mac a page's text is shown, in percent.
+    /// The size of a page's text, in percent of what fits the pane.
     web_zoom: u32,
     ui: Psf2Font,
     big: Psf2Font,
@@ -1178,13 +1180,7 @@ impl App {
         let (mut title, mut reopen) = (label.clone(), None);
         // A rexweb pane is a terminal whose screen says so. Its label can't
         // tell: rexweb sets it to the page's title.
-        let browser = creator == TERMINAL
-            && (label == web::LABEL
-                || self.ctl.as_mut().is_some_and(|ctl| {
-                    let args = json!({"format": "text", "trim": true, "max_bytes": 400});
-                    ctl.terminal(&mut self.net, "format", sid, bid, args)
-                        .is_ok_and(|v| v["content"].as_str().is_some_and(|t| t.trim_start().starts_with(web::SCREEN)))
-                }));
+        let browser = creator == TERMINAL && self.is_browser(sid, bid, &label);
         let body = match (creator.as_str(), self.ctl.as_mut()) {
             (TERMINAL, _) if browser => Body::Web(Box::new(web::WebView::new())),
             (TERMINAL, Some(ctl)) => {
@@ -1221,16 +1217,31 @@ impl App {
 
     /// Attach to the tab's session, claim its terminals, size them to this
     /// screen and start following their output.
+    /// Whether a terminal block is a rexweb pane.
+    fn is_browser(&mut self, sid: &str, bid: &str, label: &str) -> bool {
+        label == web::LABEL
+            || self.ctl.as_mut().is_some_and(|ctl| {
+                let args = json!({"format": "text", "trim": true, "max_bytes": 400});
+                ctl.terminal(&mut self.net, "format", sid, bid, args)
+                    .is_ok_and(|v| v["content"].as_str().is_some_and(|t| t.trim_start().starts_with(web::SCREEN)))
+            })
+    }
+
+    /// The terminals among `panes` to claim. Browser panes are left alone:
+    /// rexweb draws a pane on the Mac when any device has claimed or sized it.
+    fn claimable(&mut self, sid: &str, panes: &[&(String, [f64; 4], String, String)]) -> Vec<String> {
+        panes
+            .iter()
+            .filter(|p| p.2 == TERMINAL && !self.is_browser(sid, &p.0, &p.3))
+            .map(|p| p.0.clone())
+            .collect()
+    }
+
     fn open_window(&mut self, sid: &str, wid: &str, name: Option<&str>, focus: Option<&str>) -> Result<WinView, String> {
         self.call("session.attach", json!({"session_id": sid}))?;
         let view = self.call("session.view", json!({"session_id": sid}))?;
         let info = window_info(&view, wid).ok_or("that tab is gone")?;
-        let terms: Vec<&str> = info
-            .panes
-            .iter()
-            .filter(|p| p.2 == TERMINAL && p.3 != web::LABEL)
-            .map(|p| p.0.as_str())
-            .collect();
+        let terms = self.claimable(sid, &info.panes.iter().collect::<Vec<_>>());
         if !terms.is_empty() {
             self.call(
                 "session.own_block",
@@ -1334,12 +1345,7 @@ impl App {
         let zoom = wv.zoom;
         let mut old: HashMap<String, Pane> =
             std::mem::take(&mut wv.panes).into_iter().map(|p| (p.block_id.clone(), p)).collect();
-        let new_terms: Vec<&str> = info
-            .panes
-            .iter()
-            .filter(|p| p.2 == TERMINAL && p.3 != web::LABEL && !old.contains_key(&p.0))
-            .map(|p| p.0.as_str())
-            .collect();
+        let new_terms = self.claimable(&sid, &info.panes.iter().filter(|p| !old.contains_key(&p.0)).collect::<Vec<_>>());
         if !new_terms.is_empty() {
             let _ = self.call(
                 "session.own_block",
@@ -1595,7 +1601,8 @@ impl App {
             it("New tab", Act::NewTab(wv.session_id.clone())),
             it("Split right", Act::Split("horizontal")),
             it("Split down", Act::Split("vertical")),
-            it("Open browser pane", Act::Browser),
+            it("Open browser pane", Act::Browser(false)),
+            it("Open browser tab", Act::Browser(true)),
         ]);
         if wv.panes.len() > 1 {
             items.push(it(if wv.zoom { "Show all panes" } else { "Zoom this pane" }, Act::Zoom));
@@ -1814,12 +1821,20 @@ impl App {
                     let bid = focus_bid.ok_or("no pane")?;
                     self.web_act(&bid, json!({"web": op}));
                 }
-                (Act::Browser, None) => self.ask(
-                    "Open a browser pane at",
+                (Act::Browser(tab), None) => self.ask(
+                    if tab { "Open a browser tab at" } else { "Open a browser pane at" },
                     AskKind::Text { value: String::new(), hint: "an address, or words to search for".to_string() },
-                    Act::Browser,
+                    Act::Browser(tab),
                 ),
-                (Act::Browser, Some(Answer::Text(url))) => {
+                (Act::Browser(true), Some(Answer::Text(url))) => {
+                    let anchor = focus_bid.ok_or("no pane to start from")?;
+                    self.ask_helper(
+                        json!({"web": "open", "session": win_sid, "anchor": anchor, "url": url, "tab": true}),
+                        Want::OpenTab(win_sid.clone()),
+                    )?;
+                    self.say("Opening the browser tab...");
+                }
+                (Act::Browser(false), Some(Answer::Text(url))) => {
                     let anchor = focus_bid.ok_or("no pane to put it beside")?;
                     self.ask_helper(
                         json!({"web": "open", "session": win_sid, "anchor": anchor, "url": url, "split": "right"}),
@@ -2578,6 +2593,31 @@ impl App {
                     self.say(&format!("Couldn't open a browser pane: {e}"));
                 }
             }
+            Want::OpenTab(sid) => {
+                if let Some(e) = error {
+                    return self.say(&format!("Couldn't open a browser tab: {e}"));
+                }
+                let block = reply["block"].as_str().unwrap_or("").to_string();
+                let found = self.call("session.view", json!({"session_id": sid})).ok().and_then(|view| {
+                    let wids: Vec<String> = view["windows"]
+                        .as_array()?
+                        .iter()
+                        .filter_map(|w| w["window_id"].as_str().map(str::to_string))
+                        .collect();
+                    wids.into_iter().find_map(|wid| {
+                        let info = window_info(&view, &wid)?;
+                        let pane = info.panes.iter().find(|p| !block.is_empty() && p.0.ends_with(&block))?;
+                        Some((wid, pane.0.clone()))
+                    })
+                });
+                match found {
+                    Some((wid, bid)) => {
+                        self.banner = None;
+                        self.open(&sid, &wid, None, Some(&bid));
+                    }
+                    None => self.say("The browser tab opened, but I can't find it. Look in Sessions."),
+                }
+            }
         }
     }
 
@@ -3041,13 +3081,14 @@ impl App {
                     if !wb.busy && Instant::now() >= wb.next_shot {
                         wb.busy = true;
                         wb.next_shot = Instant::now() + Duration::from_secs(20);
-                        shots.push((p.block_id.clone(), inner(rect, multi).w, wb.hash.clone()));
+                        let page = web::page_rect(inner(rect, multi));
+                        shots.push((p.block_id.clone(), page.w, page.h, wb.hash.clone()));
                     }
                 }
             }
         }
-        for (bid, w, last) in shots {
-            let asked = self.ask_helper(json!({"web": "shot", "block": bid, "w": w, "last": last, "zoom": self.web_zoom}), Want::Shot(bid.clone()));
+        for (bid, w, h, last) in shots {
+            let asked = self.ask_helper(json!({"web": "shot", "block": bid, "w": w, "h": h, "last": last, "zoom": self.web_zoom}), Want::Shot(bid.clone()));
             if let (Err(e), Some((_, wb))) = (asked, self.web_pane(&bid)) {
                 wb.busy = false;
                 wb.error = Some(format!("Can't show this page: {e}"));
@@ -3620,7 +3661,7 @@ fn run() -> std::io::Result<()> {
         rot: Rot(0),
         fonts,
         font_ix,
-        web_zoom: setting("webzoom").and_then(|z| z.parse().ok()).unwrap_or(150).clamp(50, 300),
+        web_zoom: setting("webzoom").and_then(|z| z.parse().ok()).unwrap_or(100).clamp(50, 300),
         ui: parse(FONTS[1].1)?,
         big: parse(FONTS[2].1)?,
         palette: palette::Palette::new(),

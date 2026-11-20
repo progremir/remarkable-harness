@@ -128,7 +128,10 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Tap to click. Drag to scroll; the page moves when the finger lifts.
   - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
   - A bar above the page has back, forward and reload buttons and the address. Tap the address to go somewhere else.
-  - **A-** and **A+** in the bar make the page's text smaller or bigger, in steps of 25%. It starts at 150% and is kept in `/home/root/.config/rexpaper/webzoom`. The page is zoomed on the Mac too, because both show the same page.
+  - **A-** and **A+** in the bar change the page's text size in steps of 25%. The change is kept in `/home/root/.config/rexpaper/webzoom`. A pane that Rex on the Mac is also showing is zoomed there too, because both show the same page.
+  - **Open browser tab** in the menu opens a browser in a tab of its own and shows it full screen.
+  - A browser pane that Rex on the Mac isn't showing is laid out at the tablet's size. This needs one added route in rexweb: apply `rexpaper/mac/rexweb-size.patch` in your rexweb checkout and run its `install.sh`. Without it such a pane is 800 by 540 and fills only a corner.
+  - The client never claims or sizes a browser pane's terminal. rexweb draws a pane on the Mac when any device has, even over a window that isn't showing its tab.
   - The menu has the same four as **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
   - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane. A pane in a tab that Rex on the Mac isn't showing keeps rexweb's default size, 800 by 540: wide and short, so it fills only the top of a tall pane.
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.

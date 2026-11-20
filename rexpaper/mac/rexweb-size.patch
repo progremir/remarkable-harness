@@ -1,0 +1,25 @@
+diff --git a/Sources/RexWeb.swift b/Sources/RexWeb.swift
+index 74497c2..ad212b8 100644
+--- a/Sources/RexWeb.swift
++++ b/Sources/RexWeb.swift
+@@ -1313,6 +1313,20 @@ final class App: NSObject, NSApplicationDelegate {
+     switch route {
+     case "/info":
+       ok(p.info())
++    case "/size":
++      // Local addition for the reMarkable Rex client (rexpaper): lay out a
++      // pane that Rex isn't showing on this Mac at the size the client shows
++      // it. A pane on screen keeps following Rex.
++      guard !p.visible else { return ok(["sized": false]) }
++      let w = (input["width"] as? NSNumber)?.doubleValue ?? 0, h = (input["height"] as? NSNumber)?.doubleValue ?? 0
++      guard w >= 100, h >= 100, w <= 4000, h <= 4000 else { return fail("width and height must be 100 to 4000") }
++      let size = NSSize(width: w, height: h + Double(Panel.barHeight))
++      if p.window.frame.size != size {
++        p.window.setContentSize(size)
++        p.lastFrame = .zero
++        p.layout()
++      }
++      ok(["sized": true])
+     case "/loaded":
+       var replied = false
+       let timeout = (input["timeout"] as? NSNumber)?.doubleValue ?? 30

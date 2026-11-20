@@ -205,12 +205,13 @@ def rexweb(route, body, timeout=20):
 EDITABLE = """((el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAREA' ||
   (el.tagName === 'INPUT' && !['button','submit','checkbox','radio','range','file','color','image','reset'].includes(el.type))))"""
 
-# A pane that Rex on the Mac isn't showing keeps rexweb's small default size,
-# about 400 CSS pixels wide, and a page laid out for that is all headline on
-# the tablet. Halving the page's zoom lays it out as for 800. The tablet also
-# asks for its own zoom, as a percentage, because its pixels are small.
+# A pane that Rex on the Mac is showing is left exactly as the Mac lays it
+# out, unless the tablet's user asks for another text size: the zoom is the
+# page's, so the Mac sees it too. A pane the Mac isn't showing is laid out at
+# the tablet's size by rexweb's /size route (see README). Without that route
+# it keeps rexweb's 400-pixel default, and half zoom lays it out as for 800.
 JS_STATE = f"""(() => {{
-  const zoom = (innerWidth < 500 ? 0.5 : 1) * __ZOOM__ / 100;
+  const zoom = __BASE__ * __ZOOM__ / 100;
   const root = document.documentElement, want = zoom === 1 ? '' : String(zoom);
   if (root && root.style.zoom !== want) root.style.zoom = want;
   return {{vw: innerWidth, vh: innerHeight, y: Math.round(scrollY),
@@ -263,6 +264,10 @@ JS_KEY = """(() => {
 })()"""
 
 
+# The size each pane was last given, by block ID.
+SIZES = {}
+
+
 def find_rexweb():
     return shutil.which("rexweb") or os.path.expanduser("~/.local/bin/rexweb")
 
@@ -283,7 +288,18 @@ def web(msg):
         tag = "".join(c for c in block[-8:] if c.isalnum())
         png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
         zoom = max(25, min(400, int(msg.get("zoom") or 100)))
-        state = rexweb("/eval", dict(pane, js=JS_STATE.replace("__ZOOM__", str(zoom)))).get("value") or {}
+        # Two picture pixels to a point, as on a Retina Mac.
+        want = (int(msg.get("w") or 0) // 2, int(msg.get("h") or 0) // 2)
+        sized = False
+        if min(want) >= 100:
+            sized = bool(rexweb("/size", dict(pane, width=want[0], height=want[1])).get("sized"))
+            if sized and SIZES.get(block) != want:
+                time.sleep(0.3)  # the page lays itself out again
+            SIZES[block] = want if sized else None
+        shown = bool(rexweb("/info", pane).get("visible"))
+        base = "1" if sized or shown else "0.5"
+        js = JS_STATE.replace("__ZOOM__", str(zoom)).replace("__BASE__", base)
+        state = rexweb("/eval", dict(pane, js=js)).get("value") or {}
         shot = rexweb("/shot", dict(pane, path=png))
         if shot.get("error"):
             return {"error": shot["error"]}
@@ -318,7 +334,8 @@ def web(msg):
         reply = rexweb("/" + op, pane, timeout=40)
         return {"error": reply["error"]} if reply.get("error") else {"ok": 1}
     if op == "open":
-        cmd = [find_rexweb(), "open", "--no-wait", "--focus=false", "--split", str(msg.get("split", "right")),
+        where = ["--tab"] if msg.get("tab") else ["--split", str(msg.get("split", "right"))]
+        cmd = [find_rexweb(), "open", "--no-wait", "--focus=false", *where,
                "-s", str(msg.get("session", "")), "-b", str(msg.get("anchor", ""))]
         if msg.get("url"):
             cmd.append(str(msg["url"]))
