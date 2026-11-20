@@ -56,6 +56,14 @@ impl Screen {
         }
     }
 
+    /// `fast` trades some ghosting for the quickest refresh, for ink.
+    pub fn set_fast(&self, fast: bool) {
+        if let Screen::Qtfb(c) = self {
+            let mode = if fast { qtfb::REFRESH_MODE_UFAST } else { qtfb::REFRESH_MODE_FAST };
+            let _ = c.set_refresh_mode(mode);
+        }
+    }
+
     pub fn drain_events(&self) -> io::Result<Drained> {
         match self {
             Screen::Qtfb(c) => c.drain_events(),

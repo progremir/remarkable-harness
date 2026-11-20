@@ -36,6 +36,7 @@ mod font;
 mod keys;
 mod orient;
 mod palette;
+mod pen;
 mod qtfb;
 mod render;
 mod rex;
@@ -64,6 +65,7 @@ use serde_json::{json, Value};
 use crate::font::Psf2Font;
 use crate::keys::KeyAction;
 use crate::orient::Rot;
+use crate::pen::PenEv;
 use crate::render::{TermArea, BLACK, SCREEN_H, SCREEN_W, WHITE};
 use crate::rex::{Control, Net};
 use crate::screen::Screen;
@@ -86,9 +88,15 @@ const MENU_W: usize = 620;
 const KBD_SCAN: Duration = Duration::from_secs(2);
 /// Poller keys at and above this belong to keyboards: key = base + fd.
 const KBD_KEY_BASE: usize = 1000;
+/// Marks a touch event that this program made from the pen.
+const PEN_TAP: i32 = -77;
 const CONFIG_DIR: &str = "/home/root/.config/rexpaper";
 const TERMINAL: &str = "com.superlogical.terminal";
 const SHELL: &str = "com.superlogical.terminal.shell";
+/// The label of the terminal block that reads handwriting (mac/scribe.py).
+const SCRIBE: &str = "rexpaper scribe";
+/// How long the pen rests before the writing is sent off to be read.
+const INK_PAUSE: Duration = Duration::from_millis(1300);
 
 const FONTS: [(&str, &[u8]); 3] = [
     ("12x24", include_bytes!("../fonts/spleen-12x24.psfu")),
@@ -236,9 +244,13 @@ fn real_label(w: &Value) -> Option<&str> {
 
 /// Ask the server for every session and its tabs. Also returns a name for
 /// each terminal, "session / title", for notifications.
-fn load_rows(ctl: &mut Control, net: &mut Net) -> Result<(Vec<Row>, HashMap<String, String>), String> {
+type Loaded = (Vec<Row>, HashMap<String, String>, Vec<(String, String)>);
+
+fn load_rows(ctl: &mut Control, net: &mut Net) -> Result<Loaded, String> {
     let mut rows = Vec::new();
     let mut names = HashMap::new();
+    // Handwriting readers left over from an earlier run: session, block.
+    let mut scribes = Vec::new();
     let sessions = ctl.call(net, "session.list", json!({}))?;
     for s in sessions["sessions"].as_array().into_iter().flatten() {
         let Some(sid) = s["session_id"].as_str() else {
@@ -319,6 +331,10 @@ fn load_rows(ctl: &mut Control, net: &mut Net) -> Result<(Vec<Row>, HashMap<Stri
             if b["placement"] == "placed" {
                 continue;
             }
+            if b["label"] == SCRIBE {
+                scribes.push((sid.to_string(), b["block_id"].as_str().unwrap_or("").to_string()));
+                continue;
+            }
             let what = if b["creator_name"] == "com.superlogical.tunnel" { "[port forward]" } else { "[detached]" };
             rows.push(Row {
                 kind: RowKind::Note,
@@ -334,7 +350,7 @@ fn load_rows(ctl: &mut Control, net: &mut Net) -> Result<(Vec<Row>, HashMap<Stri
         status: String::new(),
         span: None,
     });
-    Ok((rows, names))
+    Ok((rows, names, scribes))
 }
 
 // ---------------------------------------------------------------- panes
@@ -484,6 +500,33 @@ const KEY_ROW: [(&str, KeyBtn); 10] = [
     ("Menu", KeyBtn::Menu),
 ];
 
+/// What the pen has written and not yet turned into text.
+#[derive(Default)]
+struct Ink {
+    /// Strokes still being written, in canvas pixels.
+    strokes: Vec<Vec<(i32, i32)>>,
+    /// Strokes sent to be read: they stay on screen until the text comes.
+    sent: Vec<Vec<(i32, i32)>>,
+    down: bool,
+    last_up: Option<Instant>,
+    /// The request waiting for its text: id, and when it was sent.
+    waiting: Option<(u64, Instant)>,
+    next_id: u64,
+    /// The pen is pressing a button, not writing.
+    tapping: Option<(i32, i32)>,
+}
+
+/// The terminal block on the server's machine that reads handwriting.
+struct Scribe {
+    sid: String,
+    bid: String,
+    /// It has said it is ready for requests.
+    ready: bool,
+    /// A request written before it was ready.
+    queued: Option<String>,
+    polled: Instant,
+}
+
 struct Retry {
     at: Instant,
     tries: u32,
@@ -527,6 +570,10 @@ struct App {
     names: HashMap<String, String>,
     retry: Option<Retry>,
     last_load: Instant,
+    ink: Ink,
+    scribe: Option<Scribe>,
+    /// The pen is read from the digitizer, so AppLoad's copies are skipped.
+    raw_pen: bool,
 }
 
 /// Where the parts of the screen are.
@@ -943,8 +990,17 @@ impl App {
         });
         let resume = self.retry.as_ref().and_then(|r| r.resume.clone());
         match result {
-            Ok((ctl, (rows, names))) => {
+            Ok((ctl, (rows, names, scribes))) => {
                 self.ctl = Some(ctl);
+                // Keep one reader from an earlier run and close the rest.
+                self.scribe = None;
+                for (i, (sid, bid)) in scribes.into_iter().enumerate() {
+                    if i == 0 {
+                        self.scribe = Some(Scribe { sid, bid, ready: true, queued: None, polled: Instant::now() });
+                    } else {
+                        self.send("block.close", json!({"session_id": sid, "block_id": bid}));
+                    }
+                }
                 self.retry = None;
                 self.names = names;
                 self.last_load = Instant::now();
@@ -994,7 +1050,7 @@ impl App {
             _ => 0,
         };
         match load_rows(ctl, &mut self.net) {
-            Ok((rows, names)) => {
+            Ok((rows, names, _)) => {
                 self.names = names;
                 self.last_load = Instant::now();
                 let top = top.min(rows.len().saturating_sub(1));
@@ -1682,6 +1738,10 @@ impl App {
             }
             return;
         }
+        let from_pen = matches!(ev.input_type, qtfb::INPUT_PEN_PRESS | qtfb::INPUT_PEN_RELEASE | qtfb::INPUT_PEN_UPDATE);
+        if from_pen && self.raw_pen && ev.dev_id != PEN_TAP {
+            return;
+        }
         let g = self.geo();
         let (x, y) = self.rot.to_logical(ev.x, ev.y, SCREEN_W, SCREEN_H);
         // A touch at the very top is a swipe for AppLoad's title bar.
@@ -1857,6 +1917,219 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------ pen
+
+    /// Draw one piece of a pen stroke on the canvas.
+    fn ink_line(&mut self, a: (i32, i32), b: (i32, i32)) {
+        let (lw, lh) = (render::canvas_w() as i32, render::canvas_h() as i32);
+        let n = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for k in 0..=n {
+            let (x, y) = (a.0 + (b.0 - a.0) * k / n, a.1 + (b.1 - a.1) * k / n);
+            if x >= 2 && y >= 2 && x < lw - 2 && y < lh - 2 {
+                render::fill_rect(&mut self.canvas, x as usize - 1, y as usize - 1, 4, 4, BLACK);
+            }
+        }
+        let (x0, y0) = ((a.0.min(b.0) - 2).max(0), (a.1.min(b.1) - 2).max(0));
+        let (x1, y1) = ((a.0.max(b.0) + 3).min(lw), (a.1.max(b.1) + 3).min(lh));
+        if x1 > x0 && y1 > y0 {
+            self.dirty.rects.push((x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize));
+        }
+    }
+
+    /// Put the ink back after the screen under it was drawn again.
+    fn redraw_ink(&mut self) {
+        let strokes: Vec<Vec<(i32, i32)>> = self.ink.sent.iter().chain(&self.ink.strokes).cloned().collect();
+        for s in strokes {
+            for w in s.windows(2) {
+                self.ink_line(w[0], w[1]);
+            }
+            if s.len() == 1 {
+                self.ink_line(s[0], s[0]);
+            }
+        }
+    }
+
+    /// The pen writes on a tab's terminals and taps everywhere else.
+    fn pen(&mut self, ev: PenEv) {
+        let g = self.geo();
+        let at = |x: i32, y: i32| self.rot.to_logical(x, y, SCREEN_W, SCREEN_H);
+        let tap = |input_type: i32, (x, y): (i32, i32)| {
+            let (px, py) = self.rot.to_phys(x.max(0) as usize, y.max(0) as usize, SCREEN_W, SCREEN_H);
+            qtfb::InputEvent { input_type, dev_id: PEN_TAP, x: px as i32, y: py as i32, d: 0 }
+        };
+        match ev {
+            PenEv::Down(px, py) => {
+                let p = at(px, py);
+                let writes = self.overlay.is_none()
+                    && matches!(&self.view, View::Win(wv) if !wv.select)
+                    && (p.1 as usize) < g.keys_y;
+                if writes {
+                    if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
+                        self.screen.set_fast(true);
+                    }
+                    self.ink.down = true;
+                    self.ink.strokes.push(vec![p]);
+                    self.ink_line(p, p);
+                } else {
+                    self.ink.tapping = Some(p);
+                    let e = tap(qtfb::INPUT_PEN_PRESS, p);
+                    self.touch(e);
+                }
+            }
+            PenEv::Move(px, py) => {
+                let p = at(px, py);
+                if self.ink.tapping.is_some() {
+                    self.ink.tapping = Some(p);
+                    let e = tap(qtfb::INPUT_PEN_UPDATE, p);
+                    self.touch(e);
+                } else if self.ink.down {
+                    let Some(last) = self.ink.strokes.last().and_then(|s| s.last().copied()) else {
+                        return;
+                    };
+                    if (p.0 - last.0).pow(2) + (p.1 - last.1).pow(2) >= 4 {
+                        self.ink.strokes.last_mut().unwrap().push(p);
+                        self.ink_line(last, p);
+                    }
+                }
+            }
+            PenEv::Up => {
+                if let Some(p) = self.ink.tapping.take() {
+                    let e = tap(qtfb::INPUT_PEN_RELEASE, p);
+                    self.touch(e);
+                } else if self.ink.down {
+                    self.ink.down = false;
+                    self.ink.last_up = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Throw the ink away and show the screen without it.
+    fn clear_ink(&mut self, all: bool) {
+        self.ink.sent.clear();
+        self.ink.waiting = None;
+        if all {
+            self.ink.strokes.clear();
+        }
+        if self.ink.strokes.is_empty() {
+            self.screen.set_fast(false);
+        }
+        if let View::Win(wv) = &mut self.view {
+            wv.repaint = true;
+        }
+    }
+
+    /// Start the handwriting reader in a terminal block of its own, in the
+    /// open tab's session. No window shows it.
+    fn start_scribe(&mut self) -> Result<(), String> {
+        let path = setting("scribe").ok_or("no reader is set up: run rexpaper/install.sh again")?;
+        let View::Win(wv) = &self.view else {
+            return Err("open a tab first".into());
+        };
+        let sid = wv.session_id.clone();
+        let made = self.call(
+            "session.new_block",
+            json!({"session_id": sid, "flavor": SHELL, "label": SCRIBE,
+                   "options": {"command": ["python3", path], "size": {"columns": 500, "rows": 60}}}),
+        )?;
+        let bid = made["block_id"].as_str().ok_or("no reader came back")?.to_string();
+        self.scribe = Some(Scribe { sid, bid, ready: false, queued: None, polled: Instant::now() });
+        Ok(())
+    }
+
+    /// The pen has rested: send what it wrote to be read.
+    fn send_ink(&mut self) {
+        if self.scribe.is_none() {
+            if let Err(e) = self.start_scribe() {
+                self.clear_ink(true);
+                return self.say(&format!("Can't read handwriting: {e}"));
+            }
+        }
+        self.ink.next_id += 1;
+        let id = self.ink.next_id;
+        let strokes: Vec<Vec<i32>> = self
+            .ink
+            .strokes
+            .iter()
+            .map(|s| s.iter().flat_map(|p| [p.0, p.1]).collect())
+            .collect();
+        let line = format!("{}\n", json!({"id": id, "strokes": strokes}));
+        self.ink.sent = std::mem::take(&mut self.ink.strokes);
+        self.ink.waiting = Some((id, Instant::now()));
+        let Some(sc) = self.scribe.as_mut() else {
+            return;
+        };
+        if sc.ready {
+            let (sid, bid) = (sc.sid.clone(), sc.bid.clone());
+            self.send(
+                &format!("{TERMINAL}.write"),
+                json!({"session_id": sid, "block_id": bid, "args": {"data": line}}),
+            );
+        } else {
+            sc.queued = Some(line);
+        }
+        self.banner = Some(("Reading your handwriting...".to_string(), Instant::now()));
+        self.touch_chrome();
+    }
+
+    /// Read what the reader has printed, and type the text it found.
+    fn poll_scribe(&mut self) {
+        let Some(sc) = self.scribe.as_mut() else {
+            return;
+        };
+        sc.polled = Instant::now();
+        let (sid, bid) = (sc.sid.clone(), sc.bid.clone());
+        let args = json!({"session_id": sid, "block_id": bid,
+                          "args": {"format": "text", "unwrap": true, "trim": true}});
+        let screen = match self.call(&format!("{TERMINAL}.format"), args) {
+            Ok(v) => v["content"].as_str().unwrap_or("").to_string(),
+            Err(_) => {
+                // The reader is gone, with its session perhaps.
+                self.scribe = None;
+                if self.ink.waiting.is_some() {
+                    self.clear_ink(false);
+                    self.say("The handwriting reader stopped. Write again to restart it.");
+                }
+                return;
+            }
+        };
+        let mut replies = Vec::new();
+        for part in screen.split("@@scribe ").skip(1) {
+            if let Some(v) = part.split("@@").next().and_then(|j| serde_json::from_str::<Value>(j).ok()) {
+                replies.push(v);
+            }
+        }
+        let mut queued = None;
+        if let Some(sc) = self.scribe.as_mut() {
+            if !sc.ready && replies.iter().any(|r| r["ready"] == 1) {
+                sc.ready = true;
+                queued = sc.queued.take();
+            }
+        }
+        if let Some(line) = queued {
+            self.send(
+                &format!("{TERMINAL}.write"),
+                json!({"session_id": sid, "block_id": bid, "args": {"data": line}}),
+            );
+        }
+        let Some((id, _)) = self.ink.waiting else {
+            return;
+        };
+        let Some(reply) = replies.iter().find(|r| r["id"].as_u64() == Some(id)) else {
+            return;
+        };
+        self.banner = None;
+        self.clear_ink(false);
+        // Old replies would otherwise pile up on the reader's screen.
+        self.send(&format!("{TERMINAL}.clear"), json!({"session_id": sid, "block_id": bid, "args": {}}));
+        match (reply["text"].as_str(), reply["error"].as_str()) {
+            (Some(text), _) if !text.is_empty() => self.type_bytes(text.as_bytes().to_vec()),
+            (_, Some(e)) => self.say(&format!("Couldn't read the handwriting: {e}")),
+            _ => self.say("Couldn't read that. Try writing it again."),
+        }
+        self.touch_chrome();
+    }
+
     /// The screen turned: lay everything out for the new shape.
     fn rotate(&mut self, rot: Rot) {
         self.rot = rot;
@@ -1906,6 +2179,15 @@ impl App {
     }
 
     fn block_event(&mut self, bid: &str, name: &str, p: &Value) {
+        if self.scribe.as_ref().is_some_and(|sc| sc.bid == bid) {
+            // The reader sets its title when it has something to say.
+            if name == "title_changed" {
+                self.poll_scribe();
+            } else if name == "child_exited" {
+                self.scribe = None;
+            }
+            return;
+        }
         let who = self.names.get(bid).cloned().unwrap_or_else(|| "A terminal".to_string());
         match name {
             "program_status_changed" => {
@@ -2087,6 +2369,25 @@ impl App {
     fn tick(&mut self) {
         if self.ctl.is_none() {
             return;
+        }
+        let rested = self.ink.last_up.is_some_and(|t| t.elapsed() >= INK_PAUSE);
+        if rested && !self.ink.down && !self.ink.strokes.is_empty() && self.ink.waiting.is_none() {
+            if matches!(self.view, View::Win(_)) {
+                self.send_ink();
+            } else {
+                self.clear_ink(true);
+            }
+        }
+        // The title change that announces a reply can be missed: look anyway.
+        let due = self.scribe.as_ref().is_some_and(|sc| {
+            (self.ink.waiting.is_some() || !sc.ready) && sc.polled.elapsed() >= Duration::from_millis(2500)
+        });
+        if due {
+            self.poll_scribe();
+        }
+        if self.ink.waiting.is_some_and(|w| w.1.elapsed() >= Duration::from_secs(60)) {
+            self.clear_ink(false);
+            self.say("Reading the handwriting took too long. Try again.");
         }
         if matches!(&self.view, View::Win(wv) if wv.stale) {
             self.refresh_window();
@@ -2349,6 +2650,7 @@ impl App {
         }
 
         if full {
+            self.redraw_ink();
             self.present();
         } else {
             self.flush();
@@ -2618,6 +2920,9 @@ fn run() -> std::io::Result<()> {
         names: HashMap::new(),
         retry: None,
         last_load: Instant::now(),
+        ink: Ink::default(),
+        scribe: None,
+        raw_pen: false,
     };
     render::set_canvas_size(SCREEN_W, SCREEN_H);
     if let Some(r) = std::env::var("REXPAPER_ROT").ok().and_then(|r| r.parse().ok()) {
@@ -2654,6 +2959,18 @@ fn run() -> std::io::Result<()> {
     let exit_after = env_secs("REXPAPER_EXIT_AFTER");
     let started = Instant::now();
 
+    let mut pen = pen::Pen::open();
+    if let Some(p) = &pen {
+        unsafe { poller.add_with_mode(&FdSource(p.raw_fd()), PollEvent::readable(3), PollMode::Level)? };
+        app.raw_pen = true;
+    }
+    // `REXPAPER_INK=strokes.json` writes those strokes with the pen, at
+    // `REXPAPER_INK_AT` seconds: [[[x, y], ...], ...] in screen pixels.
+    let mut ink_test: Option<Vec<Vec<(i32, i32)>>> = std::env::var("REXPAPER_INK")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let ink_at = env_secs("REXPAPER_INK_AT").unwrap_or(Duration::from_secs(3));
     let mut keyboards = evkbd::Keyboards::new(true);
     let mut last_kbd_scan: Option<Instant> = None;
     let mut events = Events::with_capacity(NonZeroUsize::new(32).unwrap());
@@ -2696,6 +3013,11 @@ fn run() -> std::io::Result<()> {
                     rotation = drained.rotation.or(rotation);
                     for input in drained.inputs {
                         app.touch(input);
+                    }
+                }
+                3 => {
+                    for e in pen.as_mut().map(|p| p.read()).unwrap_or_default() {
+                        app.pen(e);
                     }
                 }
                 k if k >= KBD_KEY_BASE => {
@@ -2769,6 +3091,14 @@ fn run() -> std::io::Result<()> {
                 app.touch(qtfb::InputEvent { input_type, dev_id: 0, x: px as i32, y: py as i32, d: 0 });
             }
         }
+        if started.elapsed() >= ink_at {
+            for stroke in ink_test.take().unwrap_or_default() {
+                for (i, p) in stroke.iter().enumerate() {
+                    app.pen(if i == 0 { PenEv::Down(p.0, p.1) } else { PenEv::Move(p.0, p.1) });
+                }
+                app.pen(PenEv::Up);
+            }
+        }
         if started.elapsed() >= Duration::from_secs(2) {
             // A control message as if the server had sent it.
             if let Some(text) = inject.take() {
@@ -2792,6 +3122,9 @@ fn run() -> std::io::Result<()> {
     eprintln!("rexpaper: exiting");
     if let Some(path) = &headless {
         let _ = std::fs::write(format!("{path}.txt"), app.dump_text());
+    }
+    if let Some(sc) = app.scribe.take() {
+        let _ = app.call("block.close", json!({"session_id": sc.sid, "block_id": sc.bid}));
     }
     // Hand the terminals back before the connection goes.
     if let View::Win(wv) = &app.view {

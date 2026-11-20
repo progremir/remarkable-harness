@@ -114,6 +114,10 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
 - **Keyboards:**
   - The Type Folio works as it is.
   - For AppLoad's keyboard, swipe down from the top edge and tap the keyboard button at the top left. On the first key, the terminals and the bar move up to leave room for it. When you close the keyboard, choose **Use the whole screen** in the menu.
+- **Handwriting:** write on a tab with the pen, anywhere over the terminals. About a second after you lift the pen, the ink is read and typed at the cursor of the pane you are in.
+  - The text is not submitted. To submit it, end with a return arrow (the bent arrow on an Enter key), or tap **Enter**.
+  - A finger still scrolls and taps. The pen taps the key row, the bar and the menus.
+  - Claude reads the ink on the Mac, through its Claude Code login, so `claude` must be installed there. It takes 3 to 5 seconds. `SCRIBE_MODEL` in the Mac's shell profile picks the model (default `sonnet`).
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
 - **Set-up:**
   - On the Mac, turn on Tailscale for the Rex server and read its name from `rex server status` (the `tailscale:` line).
@@ -123,6 +127,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Commands and events are JSON on the control connection, `/api/control` (`src/rex.rs`).
   - Each terminal on screen has a data connection, `/api/data`, that streams its output (`src/stream.rs`). The stream starts with a snapshot in Ghostty's format, which this client can't read. It skips the snapshot and asks for the screen as escape sequences with `com.superlogical.terminal.format`.
   - That read races with the stream, so the client reads the screen once more when the terminal goes quiet.
+  - Handwriting goes through Rex too. The client starts `mac/scribe.py` in a terminal block of its own (`session.new_block`, labelled `rexpaper scribe`), types the strokes into it as a line of JSON, and reads the text off its screen when the block changes its title. No window shows that block, and it closes when the app does.
   - The output feeds the same emulator and e-ink renderer as PaperTerm. Keys go back with `com.superlogical.terminal.write`.
   - The server documents this protocol itself: `curl --unix-socket ~/Library/Application\ Support/rex/server.sock http://rex/llms.txt`.
 - **Size:** opening a tab claims its terminals (`session.own_block`) and sizes each one to its pane on the tablet. The Mac app then shows them at that size. When another device takes one back, the bar says so, and the tablet shows that terminal's left columns and last rows. Tap the bar to fit them to the tablet again. Leaving the tab hands them back.
@@ -130,6 +135,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
 - **Settings:** each is an environment variable in the app's `run.sh`, or a file of the same name, in lower case and without the prefix, in `/home/root/.config/rexpaper/`.
   - `REXPAPER_SERVER`: the server. `host[:port]` goes through `tailscale nc`, `tls://host[:port]` connects directly, `unix:/path` uses a local socket.
   - `REXPAPER_FONT`: `12x24`, `16x32` (default) or `32x64`. The menu writes this file.
+  - `REXPAPER_SCRIBE`: where `mac/scribe.py` is on the server's machine. `install.sh` writes this file.
   - `REXPAPER_KIND`: set it to `app` to receive the questions that actions in Rex's `init.lua` ask with `rex.ui`. The tablet then shows them and sends your answer. It is off by default, because the `rex` command picks "the app" by itself only while one app is connected. With the tablet as a second app, commands that act on a client need `-C`.
 - **Try it without the tablet:** `REXPAPER_HEADLESS=frame.raw` draws into a file that `tools/fb2png.py` turns into a PNG, and writes the focused terminal's text to `frame.raw.txt`. For example, on the Mac:
 
@@ -148,12 +154,14 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   | `REXPAPER_TYPE=<text>`, `REXPAPER_TYPE_AT=<seconds>` | Types the text, 2 seconds in unless told otherwise. |
   | `REXPAPER_TAPS="3:1540,2050 4:10,80-300,80"` | Taps and drags at times, in canvas pixels. |
   | `REXPAPER_ROT=<0-3>`, `REXPAPER_KBD=1` | Starts turned, or with room left for the keyboard. |
+  | `REXPAPER_INK=strokes.json`, `REXPAPER_INK_AT=<seconds>` | Writes those strokes with the pen: `[[[x, y], ...], ...]`. |
   | `REXPAPER_DROP_AT=<seconds>` | Drops the connection, to see it come back. |
   | `REXPAPER_INJECT=<json>` | Handles a control message as if the server sent it. |
   | `REXPAPER_EXIT_AFTER=<seconds>` | Ends the run. |
 - **Limits:**
   - Floating layers are not shown. The bar says how many a tab has.
   - A block that is not a terminal shows a few lines about itself instead of its content.
+  - Handwriting can't be cancelled once the pen has rested, and the picture of it goes to Claude.
   - Copied text stays on the tablet: Rex has no call that sets the Mac's clipboard.
   - Rotation and waking from sleep were tested only in headless runs, and the Type Folio only with a virtual keyboard.
 - **Credits:** the renderer, keyboard and rotation code come from PaperTerm (MIT, `LICENSE.paperterm`). The fonts are Spleen (`fonts/LICENSE.spleen`). `tools/mkicon.py` draws the icon.
