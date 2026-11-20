@@ -599,6 +599,8 @@ struct App {
     /// part is first turned black, then drawn again a moment later. Driving
     /// the pixels both ways wipes the ghost without a full-screen refresh.
     flash: Option<Rect>,
+    /// What the eraser has cleared in the rub that is under way.
+    rubbed: Option<Rect>,
     repair_at: Option<(Rect, Instant)>,
     /// The pen has been used here before, so tabs open ready for ink.
     pen_user: bool,
@@ -2040,6 +2042,9 @@ impl App {
                     let e = tap(qtfb::INPUT_PEN_RELEASE, p);
                     self.touch(e);
                 } else if let Some((_, _, _, deleted, inked)) = self.ink.erasing.take() {
+                    if let Some(r) = self.rubbed.take() {
+                        self.flash = Some(self.flash.map_or(r, |o| o.union(r)));
+                    }
                     // A dab with the eraser deletes one character.
                     if deleted == 0 && !inked && self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
                         self.type_bytes(vec![0x7f]);
@@ -2125,7 +2130,15 @@ impl App {
         let (x0, y0) = ((x0 - 6).max(0), (y0 - 6).max(0));
         let (x1, y1) = ((x1 + 7).min(lw), (y1 + 7).min(lh));
         let r = Rect::new(x0 as usize, y0 as usize, (x1 - x0).max(1) as usize, (y1 - y0).max(1) as usize);
-        self.flash = Some(self.flash.map_or(r, |o| o.union(r)));
+        if self.ink.erasing.is_some() {
+            // Under the eraser the ink goes at once, so the rub shows. The
+            // flash that wipes its ghost waits for the eraser to lift:
+            // one flash for the whole rub.
+            self.repair = Some(self.repair.map_or(r, |o| o.union(r)));
+            self.rubbed = Some(self.rubbed.map_or(r, |o| o.union(r)));
+        } else {
+            self.flash = Some(self.flash.map_or(r, |o| o.union(r)));
+        }
     }
 
     /// Throw the ink away and show the screen without it.
@@ -2709,7 +2722,7 @@ impl App {
         let full = wv.repaint;
         let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
         // Where ink was removed: black it out now, between two strokes.
-        if let Some(r) = self.flash.filter(|_| !full && !self.ink.down) {
+        if let Some(r) = self.flash.filter(|_| !full && !self.ink.down && self.ink.erasing.is_none()) {
             self.flash = None;
             render::fill_rect(&mut self.canvas, r.x, r.y, r.w, r.h, BLACK);
             self.dirty.add_rect(r);
@@ -2717,7 +2730,7 @@ impl App {
             self.repair_at = Some((r, Instant::now() + FLASH));
         }
         if full {
-            (self.flash, self.repair_at) = (None, None);
+            (self.flash, self.repair_at, self.rubbed) = (None, None, None);
         }
         // Then wipe it, and draw what was under it again.
         let repair = self.repair.take().filter(|_| !full);
@@ -2862,7 +2875,6 @@ impl App {
             self.present();
         } else {
             if let Some(r) = repair {
-                self.dirty.rects.clear();
                 self.dirty.add_rect(r);
                 self.dirty.add(0, g.keys_y, g.lw, g.lh - g.keys_y);
             }
@@ -3138,6 +3150,7 @@ fn run() -> std::io::Result<()> {
         raw_pen: false,
         repair: None,
         flash: None,
+        rubbed: None,
         repair_at: None,
         pen_user: std::fs::metadata(format!("{CONFIG_DIR}/pen")).is_ok(),
     };
