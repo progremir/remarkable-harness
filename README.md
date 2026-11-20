@@ -110,13 +110,13 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - **Zoom this pane** fills the screen with one pane, and **Show all panes** undoes it.
   - **Select text**, then drag over the text, copies it. **Paste** types it into the pane. Text copied in a Rex terminal on the Mac can be pasted too.
   - **Smaller text** and **Larger text** switch between three sizes. The choice is kept.
-  - **Refresh screen** reads the terminals again and redraws everything.
+  - **Refresh screen** reads the terminals again and redraws everything, with a slow refresh that clears ghosts.
 - **Keyboards:**
   - The Type Folio works as it is.
   - For AppLoad's keyboard, swipe down from the top edge and tap the keyboard button at the top left. On the first key, the terminals and the bar move up to leave room for it. When you close the keyboard, choose **Use the whole screen** in the menu.
 - **Handwriting:** write on a tab with the pen, anywhere over the terminals. About a second after you lift the pen, the ink is read and typed at the cursor of the pane you are in.
   - The text is not submitted. To submit it, end with a return arrow (the bent arrow on an Enter key), or tap **Enter**.
-  - The ink goes away when its text is typed. Only that part of the screen is drawn again, so you can keep writing the next word meanwhile. A slow refresh that clears any ghost of the ink follows once the pen has been away for 4 seconds.
+  - The ink goes away when its text is typed. Only that part of the screen is drawn again, so you can keep writing the next word meanwhile. If a ghost of the ink stays, **Refresh screen** in the menu clears it.
   - The eraser end of the pen rubs out scribbles, a stroke at a time. Rubbing out everything that is being read cancels it, and nothing is typed.
   - With no scribbles on screen, the eraser deletes typed text from the cursor backwards: one character for each character's width you rub across, and one for a dab.
   - Spaces: the reader sees the line up to the cursor. It puts a space before a new word that follows a word, and none before punctuation, a file extension or the rest of a path. For a space by itself, tap **Space**, or draw the space sign: a flat line with both ends turned up.

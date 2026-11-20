@@ -523,10 +523,9 @@ struct Ink {
     fast: bool,
     /// The pen is within reach of the screen.
     near: bool,
-    /// The slow refresh is due now, with the next full one.
+    /// A slow refresh that clears ghosts is due, with the next full one.
+    /// Only **Refresh screen** asks for it.
     deghost_now: bool,
-    /// Ink was removed: the next full refresh also clears its ghosts.
-    deghost: bool,
 }
 
 /// The terminal block on the server's machine that reads handwriting.
@@ -1670,6 +1669,7 @@ impl App {
                             }
                         }
                         wv.repaint = true;
+                        self.ink.deghost_now = true;
                     }
                 }
                 (Act::Keyboard, _) => {
@@ -2125,7 +2125,6 @@ impl App {
             }
             None => r,
         });
-        self.ink.deghost = true;
     }
 
     /// Throw the ink away and show the screen without it.
@@ -2542,18 +2541,6 @@ impl App {
     fn tick(&mut self) {
         if self.ctl.is_none() {
             return;
-        }
-        // Fast ink leaves ghosts where it was removed. Clearing them takes
-        // a slow refresh of the whole screen, so wait until the pen has
-        // been away for a while, not between two words.
-        let idle = self.ink.last_up.is_none_or(|t| t.elapsed() >= Duration::from_secs(4));
-        let inked = self.ink.down || !self.ink.strokes.is_empty() || !self.ink.sent.is_empty();
-        if self.ink.deghost && idle && !inked && !self.ink.near && self.ink.erasing.is_none() {
-            self.ink.deghost = false;
-            if let View::Win(wv) = &mut self.view {
-                wv.repaint = true;
-                self.ink.deghost_now = true;
-            }
         }
         let rested = self.ink.last_up.is_some_and(|t| t.elapsed() >= INK_PAUSE);
         if rested && !self.ink.down && !self.ink.strokes.is_empty() && self.ink.waiting.is_none() {
