@@ -523,6 +523,8 @@ struct Ink {
     fast: bool,
     /// The pen is within reach of the screen.
     near: bool,
+    /// The slow refresh is due now, with the next full one.
+    deghost_now: bool,
     /// Ink was removed: the next full refresh also clears its ghosts.
     deghost: bool,
 }
@@ -531,6 +533,11 @@ struct Ink {
 struct Scribe {
     sid: String,
     bid: String,
+    /// The request that is creating the block, and the one reading its
+    /// screen. They are answered in `control_msg`: nothing here waits for
+    /// the server, because waiting would stop the ink.
+    creating: Option<String>,
+    polling: Option<String>,
     /// It has said it is ready for requests.
     ready: bool,
     /// A request written before it was ready.
@@ -585,6 +592,10 @@ struct App {
     scribe: Option<Scribe>,
     /// The pen is read from the digitizer, so AppLoad's copies are skipped.
     raw_pen: bool,
+    /// Where ink was removed: this part of the screen is drawn again.
+    repair: Option<Rect>,
+    /// The pen has been used here before, so tabs open ready for ink.
+    pen_user: bool,
 }
 
 /// Where the parts of the screen are.
@@ -947,7 +958,8 @@ impl App {
 
     /// Refresh the parts of the screen that changed.
     fn flush(&mut self) {
-        if self.settle_at.is_none() {
+        // Ink is never held back: a pen that leaves no line feels broken.
+        if self.settle_at.is_none() || self.ink.down || !self.ink.strokes.is_empty() {
             self.dirty.flush(&self.canvas, &mut self.screen, self.rot);
         }
     }
@@ -1007,7 +1019,7 @@ impl App {
                 self.scribe = None;
                 for (i, (sid, bid)) in scribes.into_iter().enumerate() {
                     if i == 0 {
-                        self.scribe = Some(Scribe { sid, bid, ready: true, queued: None, polled: Instant::now() });
+                        self.scribe = Some(Scribe { sid, bid, creating: None, polling: None, ready: true, queued: None, polled: Instant::now() });
                     } else {
                         self.send("block.close", json!({"session_id": sid, "block_id": bid}));
                     }
@@ -1053,6 +1065,7 @@ impl App {
     }
 
     fn show_list(&mut self) {
+        self.ink_mode(false);
         let Some(ctl) = self.ctl.as_mut() else {
             return self.connect();
         };
@@ -1193,6 +1206,9 @@ impl App {
         match self.open_window(sid, wid, name, focus) {
             Ok(wv) => {
                 self.view = View::Win(Box::new(wv));
+                if self.pen_user && self.raw_pen {
+                    self.ink_mode(true);
+                }
                 if let Some(old) = old {
                     self.send("session.detach", json!({"session_id": old}));
                 }
@@ -1978,10 +1994,7 @@ impl App {
                     self.ink.erasing = Some((p, p.0, p.0, 0, false));
                     self.erase(p);
                 } else if writes {
-                    if !self.ink.fast {
-                        self.ink.fast = true;
-                        self.screen.set_fast(true);
-                    }
+                    self.ink_mode(true);
                     self.ink.down = true;
                     self.ink.strokes.push(vec![p]);
                     self.ink_line(p, p);
@@ -2009,16 +2022,10 @@ impl App {
                     }
                 }
             }
-            // Switching the screen to its quickest refresh takes a moment,
-            // which made the start of the first stroke lag. Do it when the
-            // pen comes near, before it touches.
             PenEv::Near(near) => {
                 self.ink.near = near;
-                let inked = !self.ink.strokes.is_empty() || !self.ink.sent.is_empty();
-                let fast = (near && matches!(self.view, View::Win(_))) || inked;
-                if fast != self.ink.fast {
-                    self.ink.fast = fast;
-                    self.screen.set_fast(fast);
+                if near && matches!(self.view, View::Win(_)) {
+                    self.ink_mode(true);
                 }
             }
             PenEv::Up => {
@@ -2068,46 +2075,67 @@ impl App {
         let hit = |s: &Vec<(i32, i32)>| {
             s.iter().any(|q| path.iter().any(|e| (q.0 - e.0).pow(2) + (q.1 - e.1).pow(2) <= REACH * REACH))
         };
-        let before = self.ink.strokes.len() + self.ink.sent.len();
-        self.ink.strokes.retain(|s| !hit(s));
-        self.ink.sent.retain(|s| !hit(s));
-        if self.ink.strokes.len() + self.ink.sent.len() == before {
+        let (mut gone, mut kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ink.strokes).into_iter().partition(&hit);
+        self.ink.strokes = std::mem::take(&mut kept);
+        let (gone_sent, kept_sent): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ink.sent).into_iter().partition(&hit);
+        self.ink.sent = kept_sent;
+        gone.extend(gone_sent);
+        if gone.is_empty() {
             return;
         }
         self.ink.erasing = Some((p, lo, hi, deleted, true));
-        self.ink.deghost = true;
+        self.unink(&gone);
         if self.ink.sent.is_empty() && self.ink.waiting.take().is_some() {
             // Everything sent off was rubbed out: its text is not wanted.
             self.banner = None;
         }
-        if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
-            if !self.ink.near {
-                self.ink.fast = false;
-                self.screen.set_fast(false);
+    }
+
+    /// Switch the screen between its quickest refresh, for ink, and the
+    /// cleaner one. AppLoad redraws the whole window when the mode changes,
+    /// which stalls a stroke in progress, so this happens as rarely as it
+    /// can: on the way into a tab and out of it, not around each scribble.
+    fn ink_mode(&mut self, fast: bool) {
+        if fast != self.ink.fast {
+            self.ink.fast = fast;
+            self.screen.set_fast(fast);
+        }
+        if fast && !self.pen_user {
+            self.pen_user = true;
+            let _ = std::fs::write(format!("{CONFIG_DIR}/pen"), "used\n");
+        }
+    }
+
+    /// Mark where these strokes were, to draw that part of the screen again
+    /// without them. No full refresh: the pen may already be writing more.
+    fn unink(&mut self, gone: &[Vec<(i32, i32)>]) {
+        let pts = || gone.iter().flatten();
+        let (Some(x0), Some(y0)) = (pts().map(|p| p.0).min(), pts().map(|p| p.1).min()) else {
+            return;
+        };
+        let (x1, y1) = (pts().map(|p| p.0).max().unwrap(), pts().map(|p| p.1).max().unwrap());
+        let (lw, lh) = (render::canvas_w() as i32, render::canvas_h() as i32);
+        let (x0, y0) = ((x0 - 6).max(0), (y0 - 6).max(0));
+        let (x1, y1) = ((x1 + 7).min(lw), (y1 + 7).min(lh));
+        let r = Rect::new(x0 as usize, y0 as usize, (x1 - x0).max(1) as usize, (y1 - y0).max(1) as usize);
+        self.repair = Some(match self.repair {
+            Some(o) => {
+                let (ax, ay) = (o.x.min(r.x), o.y.min(r.y));
+                Rect::new(ax, ay, (o.x + o.w).max(r.x + r.w) - ax, (o.y + o.h).max(r.y + r.h) - ay)
             }
-        }
-        if let View::Win(wv) = &mut self.view {
-            wv.repaint = true;
-        }
+            None => r,
+        });
+        self.ink.deghost = true;
     }
 
     /// Throw the ink away and show the screen without it.
     fn clear_ink(&mut self, all: bool) {
-        self.ink.sent.clear();
+        let mut gone = std::mem::take(&mut self.ink.sent);
         self.ink.waiting = None;
-        self.ink.deghost = true;
         if all {
-            self.ink.strokes.clear();
+            gone.append(&mut self.ink.strokes);
         }
-        if self.ink.strokes.is_empty() {
-            if !self.ink.near {
-                self.ink.fast = false;
-                self.screen.set_fast(false);
-            }
-        }
-        if let View::Win(wv) = &mut self.view {
-            wv.repaint = true;
-        }
+        self.unink(&gone);
     }
 
     /// Start the handwriting reader in a terminal block of its own, in the
@@ -2118,13 +2146,21 @@ impl App {
             return Err("open a tab first".into());
         };
         let sid = wv.session_id.clone();
-        let made = self.call(
+        let ctl = self.ctl.as_mut().ok_or("not connected")?;
+        let id = ctl.send(
             "session.new_block",
             json!({"session_id": sid, "flavor": SHELL, "label": SCRIBE,
                    "options": {"command": ["python3", path], "size": {"columns": 500, "rows": 60}}}),
-        )?;
-        let bid = made["block_id"].as_str().ok_or("no reader came back")?.to_string();
-        self.scribe = Some(Scribe { sid, bid, ready: false, queued: None, polled: Instant::now() });
+        );
+        self.scribe = Some(Scribe {
+            sid,
+            bid: String::new(),
+            creating: Some(id),
+            polling: None,
+            ready: false,
+            queued: None,
+            polled: Instant::now(),
+        });
         Ok(())
     }
 
@@ -2174,27 +2210,39 @@ impl App {
         self.touch_chrome();
     }
 
-    /// Read what the reader has printed, and type the text it found.
+    /// Ask for the reader's screen. The answer comes to `scribe_screen`.
     fn poll_scribe(&mut self) {
-        let Some(sc) = self.scribe.as_mut() else {
+        let (Some(sc), Some(ctl)) = (self.scribe.as_mut(), self.ctl.as_mut()) else {
             return;
         };
+        let stuck = sc.polled.elapsed() >= Duration::from_secs(8);
+        if sc.bid.is_empty() || (sc.polling.is_some() && !stuck) {
+            return;
+        }
         sc.polled = Instant::now();
-        let (sid, bid) = (sc.sid.clone(), sc.bid.clone());
-        let args = json!({"session_id": sid, "block_id": bid,
-                          "args": {"format": "text", "unwrap": true, "trim": true}});
-        let screen = match self.call(&format!("{TERMINAL}.format"), args) {
-            Ok(v) => v["content"].as_str().unwrap_or("").to_string(),
-            Err(_) => {
-                // The reader is gone, with its session perhaps.
-                self.scribe = None;
-                if self.ink.waiting.is_some() {
-                    self.clear_ink(false);
-                    self.say("The handwriting reader stopped. Write again to restart it.");
-                }
-                return;
-            }
+        sc.polling = Some(ctl.send(
+            &format!("{TERMINAL}.format"),
+            json!({"session_id": sc.sid, "block_id": sc.bid,
+                   "args": {"format": "text", "unwrap": true, "trim": true}}),
+        ));
+    }
+
+    /// The reader could not be started or reached.
+    fn scribe_lost(&mut self, why: &str) {
+        self.scribe = None;
+        if self.ink.waiting.is_some() {
+            self.banner = None;
+            self.clear_ink(false);
+            self.say(&format!("The handwriting reader stopped ({why}). Write again to restart it."));
+        }
+    }
+
+    /// What the reader has printed: type the text it found.
+    fn scribe_screen(&mut self, screen: &str) {
+        let Some(sc) = self.scribe.as_ref() else {
+            return;
         };
+        let (sid, bid) = (sc.sid.clone(), sc.bid.clone());
         let mut replies = Vec::new();
         for part in screen.split("@@scribe ").skip(1) {
             if let Some(v) = part.split("@@").next().and_then(|j| serde_json::from_str::<Value>(j).ok()) {
@@ -2281,7 +2329,7 @@ impl App {
     }
 
     fn block_event(&mut self, bid: &str, name: &str, p: &Value) {
-        if self.scribe.as_ref().is_some_and(|sc| sc.bid == bid) {
+        if self.scribe.as_ref().is_some_and(|sc| sc.bid == bid && !bid.is_empty()) {
             // The reader sets its title when it has something to say.
             if name == "title_changed" {
                 self.poll_scribe();
@@ -2341,6 +2389,29 @@ impl App {
             return;
         };
         if v["type"] == "response" {
+            let id = v["id"].as_str();
+            let failed = v.get("error").filter(|e| !e.is_null()).map(|e| e["message"].as_str().unwrap_or("failed").to_string());
+            if let Some(sc) = self.scribe.as_mut() {
+                if sc.creating.as_deref() == id && id.is_some() {
+                    sc.creating = None;
+                    match (failed, v["payload"]["block_id"].as_str()) {
+                        (None, Some(bid)) => sc.bid = bid.to_string(),
+                        (why, _) => self.scribe_lost(&why.unwrap_or_else(|| "no reader came back".to_string())),
+                    }
+                    return;
+                }
+                if sc.polling.as_deref() == id && id.is_some() {
+                    sc.polling = None;
+                    match failed {
+                        None => {
+                            let screen = v["payload"]["content"].as_str().unwrap_or("").to_string();
+                            self.scribe_screen(&screen);
+                        }
+                        Some(why) => self.scribe_lost(&why),
+                    }
+                    return;
+                }
+            }
             if let View::Win(wv) = &mut self.view {
                 for p in wv.panes.iter_mut() {
                     if let Body::Term(tv) = &mut p.body {
@@ -2471,6 +2542,18 @@ impl App {
     fn tick(&mut self) {
         if self.ctl.is_none() {
             return;
+        }
+        // Fast ink leaves ghosts where it was removed. Clearing them takes
+        // a slow refresh of the whole screen, so wait until the pen has
+        // been away for a while, not between two words.
+        let idle = self.ink.last_up.is_none_or(|t| t.elapsed() >= Duration::from_secs(4));
+        let inked = self.ink.down || !self.ink.strokes.is_empty() || !self.ink.sent.is_empty();
+        if self.ink.deghost && idle && !inked && !self.ink.near && self.ink.erasing.is_none() {
+            self.ink.deghost = false;
+            if let View::Win(wv) = &mut self.view {
+                wv.repaint = true;
+                self.ink.deghost_now = true;
+            }
         }
         let rested = self.ink.last_up.is_some_and(|t| t.elapsed() >= INK_PAUSE);
         if rested && !self.ink.down && !self.ink.strokes.is_empty() && self.ink.waiting.is_none() {
@@ -2637,24 +2720,30 @@ impl App {
         };
         let full = wv.repaint;
         let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+        // Where ink was removed: wipe it, and draw what was under it again.
+        let repair = self.repair.take().filter(|_| !full);
         if full {
             wv.repaint = false;
             wv.chrome.clear();
             render::fill_rect(&mut self.canvas, 0, 0, g.lw, g.lh, WHITE);
+        } else if let Some(r) = repair {
+            wv.chrome.clear();
+            render::fill_rect(&mut self.canvas, r.x, r.y, r.w, r.h, WHITE);
         }
+        let redo = full || repair.is_some();
         let focus = wv.focus;
         for (i, pane) in wv.panes.iter_mut().enumerate() {
             let Some(rect) = pane.rect else {
                 continue;
             };
             if multi {
-                if full {
+                if redo {
                     // Dividing lines on the pane's right and bottom edges.
                     render::fill_rect(&mut self.canvas, rect.x + rect.w - 3, rect.y, 3, rect.h, BLACK);
                     render::fill_rect(&mut self.canvas, rect.x, rect.y + rect.h - 3, rect.w, 3, BLACK);
                 }
                 let key = format!("{}{}", if i == focus { '*' } else { ' ' }, pane.title);
-                if full || key != pane.title_drawn {
+                if redo || key != pane.title_drawn {
                     let strip = Rect::new(rect.x, rect.y, rect.w.saturating_sub(3), TITLE_H);
                     ui::line(&mut self.canvas, &self.ui, strip, &pane.title, i == focus);
                     self.dirty.add_rect(strip);
@@ -2665,6 +2754,22 @@ impl App {
                 Body::Term(tv) => {
                     if full || tv.shadow.len() != tv.area.rows * tv.area.cols {
                         tv.shadow = vec![u64::MAX; tv.area.rows * tv.area.cols];
+                    }
+                    if let Some(r) = repair {
+                        // Forget what the cells under the wiped part showed.
+                        let a = &tv.area;
+                        for row in 0..a.rows {
+                            let y = a.y0 + row * a.ch;
+                            if y + a.ch <= r.y || y >= r.y + r.h {
+                                continue;
+                            }
+                            for col in 0..a.cols {
+                                let x = a.x0 + col * a.cw;
+                                if x + a.cw > r.x && x < r.x + r.w {
+                                    tv.shadow[row * a.cols + col] = u64::MAX;
+                                }
+                            }
+                        }
                     }
                     let sel = tv.term.selection.as_ref().and_then(|s| s.to_range(&tv.term));
                     // Redraw only the cells whose look changed, and per row
@@ -2703,7 +2808,7 @@ impl App {
                         }
                     }
                 }
-                Body::Info(lines) if full => {
+                Body::Info(lines) if redo => {
                     let r = inner(rect, multi);
                     for (n, text) in lines.iter().enumerate() {
                         let y = r.y + 40 + n * 48;
@@ -2751,10 +2856,17 @@ impl App {
             wv.chrome = chrome;
         }
 
-        if full {
+        if redo {
             self.redraw_ink();
+        }
+        if full {
             self.present();
         } else {
+            if let Some(r) = repair {
+                self.dirty.rects.clear();
+                self.dirty.add_rect(r);
+                self.dirty.add(0, g.keys_y, g.lw, g.lh - g.keys_y);
+            }
             self.flush();
         }
     }
@@ -3025,6 +3137,8 @@ fn run() -> std::io::Result<()> {
         ink: Ink::default(),
         scribe: None,
         raw_pen: false,
+        repair: None,
+        pen_user: std::fs::metadata(format!("{CONFIG_DIR}/pen")).is_ok(),
     };
     render::set_canvas_size(SCREEN_W, SCREEN_H);
     if let Some(r) = std::env::var("REXPAPER_ROT").ok().and_then(|r| r.parse().ok()) {
@@ -3092,7 +3206,7 @@ fn run() -> std::io::Result<()> {
         if app.settle_at.is_some_and(|at| Instant::now() >= at) {
             app.settle_at = None;
             app.show_all();
-            if std::mem::take(&mut app.ink.deghost) {
+            if std::mem::take(&mut app.ink.deghost_now) {
                 app.screen.deghost();
             }
         }
@@ -3229,7 +3343,7 @@ fn run() -> std::io::Result<()> {
     if let Some(path) = &headless {
         let _ = std::fs::write(format!("{path}.txt"), app.dump_text());
     }
-    if let Some(sc) = app.scribe.take() {
+    if let Some(sc) = app.scribe.take().filter(|sc| !sc.bid.is_empty()) {
         let _ = app.call("block.close", json!({"session_id": sc.sid, "block_id": sc.bid}));
     }
     // Hand the terminals back before the connection goes.
