@@ -1173,8 +1173,17 @@ impl App {
         // A pane hidden by zoom is sized as if it filled the screen.
         let r = inner(rect.unwrap_or(Rect::new(0, 0, g.lw, g.keys_y)), multi && rect.is_some());
         let (mut title, mut reopen) = (label.clone(), None);
+        // A rexweb pane is a terminal whose screen says so. Its label can't
+        // tell: rexweb sets it to the page's title.
+        let browser = creator == TERMINAL
+            && (label == web::LABEL
+                || self.ctl.as_mut().is_some_and(|ctl| {
+                    let args = json!({"format": "text", "trim": true, "max_bytes": 400});
+                    ctl.terminal(&mut self.net, "format", sid, bid, args)
+                        .is_ok_and(|v| v["content"].as_str().is_some_and(|t| t.trim_start().starts_with(web::SCREEN)))
+                }));
         let body = match (creator.as_str(), self.ctl.as_mut()) {
-            (TERMINAL, _) if label == web::LABEL => Body::Web(Box::new(web::WebView::new())),
+            (TERMINAL, _) if browser => Body::Web(Box::new(web::WebView::new())),
             (TERMINAL, Some(ctl)) => {
                 if let Some(t) = ctl
                     .terminal(&mut self.net, "title", sid, bid, json!({}))

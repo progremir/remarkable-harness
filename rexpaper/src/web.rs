@@ -9,8 +9,10 @@ use crate::font::Psf2Font;
 use crate::render::{self, BLACK, WHITE};
 use crate::ui::{self, Rect};
 
-/// The label rexweb gives its panes.
+/// The label rexweb gives a pane until its page has a title.
 pub const LABEL: &str = "browser";
+/// What the terminal under a rexweb pane shows: "rexweb · " and the address.
+pub const SCREEN: &str = "rexweb \u{b7}";
 
 pub struct WebView {
     /// The page as last seen: RGB565, `iw` x `ih`.

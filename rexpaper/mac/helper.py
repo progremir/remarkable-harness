@@ -205,9 +205,16 @@ def rexweb(route, body, timeout=20):
 EDITABLE = """((el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAREA' ||
   (el.tagName === 'INPUT' && !['button','submit','checkbox','radio','range','file','color','image','reset'].includes(el.type))))"""
 
-JS_STATE = f"""(() => ({{vw: innerWidth, vh: innerHeight, y: Math.round(scrollY),
+# A pane that Rex on the Mac isn't showing keeps rexweb's small default size,
+# about 400 CSS pixels wide, and a page laid out for that is all headline on
+# the tablet. Halving the page's zoom lays it out as for 800.
+JS_STATE = f"""(() => {{
+  const root = document.documentElement, want = innerWidth < 500 ? '0.5' : '';
+  if (root && root.style.zoom !== want) root.style.zoom = want;
+  return {{vw: innerWidth, vh: innerHeight, y: Math.round(scrollY),
   full: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0),
-  edit: {EDITABLE}(document.activeElement)}}))()"""
+  edit: {EDITABLE}(document.activeElement)}};
+}})()"""
 
 JS_TAP = """(() => {
   const x = %s, y = %s;
@@ -273,10 +280,10 @@ def web(msg):
     if op == "shot":
         tag = "".join(c for c in block[-8:] if c.isalnum())
         png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
+        state = rexweb("/eval", dict(pane, js=JS_STATE)).get("value") or {}
         shot = rexweb("/shot", dict(pane, path=png))
         if shot.get("error"):
             return {"error": shot["error"]}
-        state = rexweb("/eval", dict(pane, js=JS_STATE)).get("value") or {}
         info = rexweb("/info", pane)
         width = max(64, min(int(msg.get("w") or 1200), int(shot.get("width") or 1200)))
         done = subprocess.run(["sips", "--resampleWidth", str(width), "-s", "format", "jpeg",

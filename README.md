@@ -128,7 +128,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Tap to click. Drag to scroll; the page moves when the finger lifts.
   - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
   - The menu gains **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
-  - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane.
+  - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane. A pane in a tab that Rex on the Mac isn't showing keeps rexweb's default size, 800 by 540: wide and short, so it fills only the top of a tall pane.
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
 - **Set-up:**
   - On the Mac, turn on Tailscale for the Rex server and read its name from `rex server status` (the `tailscale:` line).
@@ -174,7 +174,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   | `REXPAPER_INJECT=<json>` | Handles a control message as if the server sent it. |
   | `REXPAPER_EXIT_AFTER=<seconds>` | Ends the run. |
 - **Limits:**
-  - Browser panes: clicks and keys are made in JavaScript, not by a real mouse and keyboard, so a page that checks for real input may ignore them. Pictures come every 6 seconds and after each thing you do, so video and animation don't play. Tested against a stand-in for rexweb, not rexweb itself.
+  - Browser panes: clicks and keys are made in JavaScript, not by a real mouse and keyboard, so a page that checks for real input may ignore them. Pictures come every 6 seconds and after each thing you do, so video and animation don't play.
   - Floating layers are not shown. The bar says how many a tab has.
   - A block that is not a terminal shows a few lines about itself instead of its content.
   - The picture of your handwriting goes to Claude.
