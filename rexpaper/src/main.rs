@@ -606,6 +606,9 @@ struct App {
     /// part is drawn again in the clean mode once the pen is up.
     flash: Option<Rect>,
     /// What the eraser has cleared in the rub that is under way.
+    /// Log pen timings (the `trace` setting).
+    trace: bool,
+    trace_down: Option<Instant>,
     /// The screen's mode now, and when a spell of the clean mode ends.
     mode: i32,
     clean_until: Option<Instant>,
@@ -971,6 +974,11 @@ impl App {
 
     /// Refresh the parts of the screen that changed.
     fn flush(&mut self) {
+        if let Some(t) = self.trace_down.filter(|_| !self.dirty.rects.is_empty()) {
+            eprintln!("rexpaper: trace first ink sent {} us after the pen landed, held {}", t.elapsed().as_micros(),
+                !(self.settle_at.is_none() || self.ink.down || !self.ink.strokes.is_empty()));
+            self.trace_down = None;
+        }
         // Ink is never held back: a pen that leaves no line feels broken.
         if self.settle_at.is_none() || self.ink.down || !self.ink.strokes.is_empty() {
             self.dirty.flush(&self.canvas, &mut self.screen, self.rot);
@@ -2012,6 +2020,10 @@ impl App {
                     self.erase(p);
                 } else if writes {
                     self.clean_until = None;
+                    if self.trace {
+                        eprintln!("rexpaper: trace pen down, mode was {}, near {}", self.mode, self.ink.near);
+                        self.trace_down = Some(Instant::now());
+                    }
                     self.set_mode(MODE_INK);
                     self.ink.down = true;
                     self.ink.strokes.push(vec![p]);
@@ -2044,6 +2056,9 @@ impl App {
                 // Get ready for ink as the pen approaches, not when it lands.
                 self.ink.near = near;
                 self.ink.away = Some(Instant::now());
+                if self.trace {
+                    eprintln!("rexpaper: trace pen near {near}");
+                }
                 if near && matches!(self.view, View::Win(_)) && self.clean_until.is_none() {
                     self.set_mode(MODE_INK);
                 }
@@ -2494,7 +2509,10 @@ impl App {
                             wv.stale = true;
                         }
                     }
-                    "block_closed" | "block_created" => wv.stale = true,
+                    // A block that joins a tab also changes the view, which is
+                    // handled above. One that is in no tab, like the
+                    // handwriting reader, needs nothing drawn again.
+                    "block_closed" if wv.panes.iter().any(|pn| pn.block_id == bid) => wv.stale = true,
                     "block_owner_changed" => {
                         if let Some(Pane { body: Body::Term(tv), .. }) =
                             wv.panes.iter_mut().find(|pn| pn.block_id == bid)
@@ -3151,6 +3169,8 @@ fn run() -> std::io::Result<()> {
         raw_pen: false,
         repair: None,
         flash: None,
+        trace: setting("trace").is_some(),
+        trace_down: None,
         mode: MODE_TEXT,
         clean_until: None,
     };
@@ -3218,6 +3238,7 @@ fn run() -> std::io::Result<()> {
             .map(|at| at.saturating_duration_since(Instant::now()))
             .fold(Duration::from_millis(300), Duration::min);
         poller.wait(&mut events, Some(nap))?;
+        let woke = Instant::now();
         if app.clean_until.is_some_and(|at| Instant::now() >= at) {
             app.clean_until = None;
             let near = app.ink.near && matches!(app.view, View::Win(_));
@@ -3262,6 +3283,10 @@ fn run() -> std::io::Result<()> {
                 }
                 3 => {
                     for e in pen.as_mut().map(|p| p.read()).unwrap_or_default() {
+                        if app.trace && matches!(e, PenEv::Down(..)) {
+                            let age = pen.as_ref().map_or(0, |p| p.down_age_us);
+                            eprintln!("rexpaper: trace {:.3} pen landed {} us before it was read", started.elapsed().as_secs_f64(), age);
+                        }
                         app.pen(e);
                     }
                 }
@@ -3294,9 +3319,11 @@ fn run() -> std::io::Result<()> {
             }
         }
 
+        let t_net = Instant::now();
         while let Some((id, msg)) = app.net.pop() {
             app.net_msg(id, msg);
         }
+        let net_ms = t_net.elapsed().as_millis();
 
         if let Some(r) = rotation {
             let rot = Rot::from_appload(r, false);
@@ -3318,7 +3345,9 @@ fn run() -> std::io::Result<()> {
         {
             app.show_list();
         }
+        let t_tick = Instant::now();
         app.tick();
+        let tick_ms = t_tick.elapsed().as_millis();
         if app.banner.as_ref().is_some_and(|b| b.1.elapsed() >= Duration::from_secs(30)) {
             app.banner = None;
             app.touch_chrome();
@@ -3361,7 +3390,16 @@ fn run() -> std::io::Result<()> {
             }
         }
 
+        let t_draw = Instant::now();
         app.draw();
+        if app.trace && woke.elapsed() >= Duration::from_millis(25) {
+            eprintln!(
+                "rexpaper: trace {:.3} slow loop {} ms (net {net_ms}, tick {tick_ms}, draw {})",
+                started.elapsed().as_secs_f64(),
+                woke.elapsed().as_millis(),
+                t_draw.elapsed().as_millis()
+            );
+        }
     }
 
     eprintln!("rexpaper: exiting");

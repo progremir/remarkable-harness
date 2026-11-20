@@ -51,6 +51,10 @@ pub struct Keyboards {
     devices: Vec<Device>,
     mods: Mods,
     grab: bool,
+    /// Devices already looked at and found not to be keyboards. Opening
+    /// them again on every scan stalled the program for a tenth of a
+    /// second each time, which showed as lag in pen strokes.
+    others: Vec<std::path::PathBuf>,
 }
 
 /// A key press decoded to a terminal action plus modifier state.
@@ -66,6 +70,7 @@ impl Keyboards {
             devices: Vec::new(),
             mods: Mods::default(),
             grab,
+            others: Vec::new(),
         }
     }
 
@@ -76,13 +81,15 @@ impl Keyboards {
         let Ok(entries) = fs::read_dir("/dev/input") else {
             return added;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let present: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        // A device that went away may come back as something else.
+        self.others.retain(|p| present.contains(p));
+        for path in present {
             let is_event = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("event"));
-            if !is_event || self.devices.iter().any(|d| d.path == path) {
+            if !is_event || self.others.contains(&path) || self.devices.iter().any(|d| d.path == path) {
                 continue;
             }
             let Ok(file) = OpenOptions::new()
@@ -93,7 +100,8 @@ impl Keyboards {
                 continue;
             };
             if !has_letter_keys(file.as_raw_fd()) {
-                continue; // power button, touch panel, pen, ...
+                self.others.push(path); // power button, touch panel, pen, ...
+                continue;
             }
             if self.grab {
                 unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB as _, 1 as libc::c_int) };

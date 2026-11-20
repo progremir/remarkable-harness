@@ -18,6 +18,8 @@ pub enum PenEv {
 
 pub struct Pen {
     fd: RawFd,
+    /// How long ago the kernel saw the last touch-down, when it was read.
+    pub down_age_us: i64,
     raw: (i32, i32),
     touching: bool,
     was_touching: bool,
@@ -44,7 +46,7 @@ impl Pen {
             let path = std::ffi::CString::new(format!("/dev/input/{name}")).ok()?;
             let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
             if fd >= 0 {
-                return Some(Pen { fd, raw: (0, 0), touching: false, was_touching: false, rubber: false, near: false, was_near: false, last: (-1, -1) });
+                return Some(Pen { fd, down_age_us: 0, raw: (0, 0), touching: false, was_touching: false, rubber: false, near: false, was_near: false, last: (-1, -1) });
             }
         }
         None
@@ -68,6 +70,8 @@ impl Pen {
                 let kind = u16::from_le_bytes([ev[16], ev[17]]);
                 let code = u16::from_le_bytes([ev[18], ev[19]]);
                 let value = i32::from_le_bytes([ev[20], ev[21], ev[22], ev[23]]);
+                let stamp = i64::from_le_bytes(ev[0..8].try_into().unwrap()) * 1_000_000
+                    + i64::from_le_bytes(ev[8..16].try_into().unwrap());
                 match (kind, code) {
                     (3, 0) => self.raw.0 = value,
                     (3, 1) => self.raw.1 = value,
@@ -85,7 +89,13 @@ impl Pen {
                         }
                         let p = (self.raw.0 * (pw - 1) / PEN_MAX.0, self.raw.1 * (ph - 1) / PEN_MAX.1);
                         match (self.was_touching, self.touching) {
-                            (false, true) => out.push(PenEv::Down(p.0, p.1, self.rubber)),
+                            (false, true) => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_micros() as i64);
+                                self.down_age_us = now - stamp;
+                                out.push(PenEv::Down(p.0, p.1, self.rubber))
+                            }
                             (true, true) if p != self.last => out.push(PenEv::Move(p.0, p.1)),
                             (true, false) => out.push(PenEv::Up),
                             _ => {}

@@ -144,6 +144,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - `REXPAPER_SERVER`: the server. `host[:port]` goes through `tailscale nc`, `tls://host[:port]` connects directly, `unix:/path` uses a local socket.
   - `REXPAPER_FONT`: `12x24`, `16x32` (default) or `32x64`. The menu writes this file.
   - `REXPAPER_SCRIBE`: where `mac/scribe.py` is on the server's machine. `install.sh` writes this file.
+  - `REXPAPER_TRACE`: set it to log pen timings to `/tmp/rexpaper.log`: how late each touch was read, how soon its ink was sent to the screen, and any pass of the main loop that took over 25 ms.
   - `REXPAPER_KIND`: set it to `app` to receive the questions that actions in Rex's `init.lua` ask with `rex.ui`. The tablet then shows them and sends your answer. It is off by default, because the `rex` command picks "the app" by itself only while one app is connected. With the tablet as a second app, commands that act on a client need `-C`.
 - **Try it without the tablet:** `REXPAPER_HEADLESS=frame.raw` draws into a file that `tools/fb2png.py` turns into a PNG, and writes the focused terminal's text to `frame.raw.txt`. For example, on the Mac:
 
