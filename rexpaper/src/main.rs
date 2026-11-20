@@ -97,6 +97,8 @@ const SHELL: &str = "com.superlogical.terminal.shell";
 const SCRIBE: &str = "rexpaper scribe";
 /// How long the pen rests before the writing is sent off to be read.
 const INK_PAUSE: Duration = Duration::from_millis(1300);
+/// How long the place of removed ink stays black before it is drawn again.
+const FLASH: Duration = Duration::from_millis(180);
 
 const FONTS: [(&str, &[u8]); 3] = [
     ("12x24", include_bytes!("../fonts/spleen-12x24.psfu")),
@@ -593,6 +595,11 @@ struct App {
     raw_pen: bool,
     /// Where ink was removed: this part of the screen is drawn again.
     repair: Option<Rect>,
+    /// Where ink was removed and its ghost is still to be cleared: that
+    /// part is first turned black, then drawn again a moment later. Driving
+    /// the pixels both ways wipes the ghost without a full-screen refresh.
+    flash: Option<Rect>,
+    repair_at: Option<(Rect, Instant)>,
     /// The pen has been used here before, so tabs open ready for ink.
     pen_user: bool,
 }
@@ -2118,13 +2125,7 @@ impl App {
         let (x0, y0) = ((x0 - 6).max(0), (y0 - 6).max(0));
         let (x1, y1) = ((x1 + 7).min(lw), (y1 + 7).min(lh));
         let r = Rect::new(x0 as usize, y0 as usize, (x1 - x0).max(1) as usize, (y1 - y0).max(1) as usize);
-        self.repair = Some(match self.repair {
-            Some(o) => {
-                let (ax, ay) = (o.x.min(r.x), o.y.min(r.y));
-                Rect::new(ax, ay, (o.x + o.w).max(r.x + r.w) - ax, (o.y + o.h).max(r.y + r.h) - ay)
-            }
-            None => r,
-        });
+        self.flash = Some(self.flash.map_or(r, |o| o.union(r)));
     }
 
     /// Throw the ink away and show the screen without it.
@@ -2707,7 +2708,18 @@ impl App {
         };
         let full = wv.repaint;
         let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
-        // Where ink was removed: wipe it, and draw what was under it again.
+        // Where ink was removed: black it out now, between two strokes.
+        if let Some(r) = self.flash.filter(|_| !full && !self.ink.down) {
+            self.flash = None;
+            render::fill_rect(&mut self.canvas, r.x, r.y, r.w, r.h, BLACK);
+            self.dirty.add_rect(r);
+            let r = self.repair_at.map_or(r, |o| o.0.union(r));
+            self.repair_at = Some((r, Instant::now() + FLASH));
+        }
+        if full {
+            (self.flash, self.repair_at) = (None, None);
+        }
+        // Then wipe it, and draw what was under it again.
         let repair = self.repair.take().filter(|_| !full);
         if full {
             wv.repaint = false;
@@ -3125,6 +3137,8 @@ fn run() -> std::io::Result<()> {
         scribe: None,
         raw_pen: false,
         repair: None,
+        flash: None,
+        repair_at: None,
         pen_user: std::fs::metadata(format!("{CONFIG_DIR}/pen")).is_ok(),
     };
     render::set_canvas_size(SCREEN_W, SCREEN_H);
@@ -3185,11 +3199,16 @@ fn run() -> std::io::Result<()> {
             break;
         }
         events.clear();
-        let nap = match app.settle_at {
-            Some(at) => at.saturating_duration_since(Instant::now()).min(Duration::from_millis(300)),
-            None => Duration::from_millis(300),
-        };
+        let nap = [app.settle_at, app.repair_at.map(|r| r.1)]
+            .into_iter()
+            .flatten()
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .fold(Duration::from_millis(300), Duration::min);
         poller.wait(&mut events, Some(nap))?;
+        if let Some((r, _)) = app.repair_at.filter(|r| Instant::now() >= r.1) {
+            app.repair_at = None;
+            app.repair = Some(app.repair.map_or(r, |o| o.union(r)));
+        }
         if app.settle_at.is_some_and(|at| Instant::now() >= at) {
             app.settle_at = None;
             app.show_all();

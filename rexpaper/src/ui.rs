@@ -17,6 +17,12 @@ impl Rect {
         Rect { x, y, w, h }
     }
 
+    /// The smallest rect that holds both.
+    pub fn union(&self, o: Rect) -> Rect {
+        let (x, y) = (self.x.min(o.x), self.y.min(o.y));
+        Rect::new(x, y, (self.x + self.w).max(o.x + o.w) - x, (self.y + self.h).max(o.y + o.h) - y)
+    }
+
     pub fn has(&self, x: i32, y: i32) -> bool {
         x >= self.x as i32
             && y >= self.y as i32
