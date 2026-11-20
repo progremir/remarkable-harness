@@ -205,15 +205,15 @@ def rexweb(route, body, timeout=20):
 EDITABLE = """((el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAREA' ||
   (el.tagName === 'INPUT' && !['button','submit','checkbox','radio','range','file','color','image','reset'].includes(el.type))))"""
 
-# A pane that Rex on the Mac is showing is left exactly as the Mac lays it
-# out, unless the tablet's user asks for another text size: the zoom is the
-# page's, so the Mac sees it too. A pane the Mac isn't showing is laid out at
-# the tablet's size by rexweb's /size route (see README). Without that route
-# it keeps rexweb's 400-pixel default, and half zoom lays it out as for 800.
+# A page is laid out for the device looking at it, as a terminal is sized: the
+# helper asks rexweb (its /size route, see README) for the tablet pane's size
+# in CSS pixels, and rexweb holds it while the tablet keeps asking. The
+# tablet's text size makes that size smaller or bigger. A rexweb without the
+# route shows the page as the Mac has it. An earlier helper set a zoom on the
+# page itself; this clears it.
 JS_STATE = f"""(() => {{
-  const zoom = __BASE__ * __ZOOM__ / 100;
-  const root = document.documentElement, want = zoom === 1 ? '' : String(zoom);
-  if (root && root.style.zoom !== want) root.style.zoom = want;
+  const root = document.documentElement;
+  if (root && root.style.zoom) root.style.zoom = '';
   return {{vw: innerWidth, vh: innerHeight, y: Math.round(scrollY),
   full: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0),
   edit: {EDITABLE}(document.activeElement)}};
@@ -288,19 +288,19 @@ def web(msg):
         tag = "".join(c for c in block[-8:] if c.isalnum())
         png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
         zoom = max(25, min(400, int(msg.get("zoom") or 100)))
-        # Two picture pixels to a point, as on a Retina Mac.
-        want = (int(msg.get("w") or 0) // 2, int(msg.get("h") or 0) // 2)
+        w, h = int(msg.get("w") or 0), int(msg.get("h") or 0)
+        # Two tablet pixels to a CSS pixel at 100%: text is then about the
+        # size it is on paper.
+        want = (round(w * 50 / zoom), round(h * 50 / zoom))
         sized = False
         if min(want) >= 100:
-            sized = bool(rexweb("/size", dict(pane, width=want[0], height=want[1])).get("sized"))
+            sized = bool(rexweb("/size", dict(pane, width=want[0], height=want[1], hold=20)).get("sized"))
             if sized and SIZES.get(block) != want:
-                time.sleep(0.3)  # the page lays itself out again
+                time.sleep(0.4)  # the page lays itself out again
             SIZES[block] = want if sized else None
-        shown = bool(rexweb("/info", pane).get("visible"))
-        base = "1" if sized or shown else "0.5"
-        js = JS_STATE.replace("__ZOOM__", str(zoom)).replace("__BASE__", base)
-        state = rexweb("/eval", dict(pane, js=js)).get("value") or {}
-        shot = rexweb("/shot", dict(pane, path=png))
+        state = rexweb("/eval", dict(pane, js=JS_STATE)).get("value") or {}
+        # Ask for the picture at the tablet's own width, so it isn't stretched.
+        shot = rexweb("/shot", dict(pane, path=png, width=w / 2) if sized else dict(pane, path=png))
         if shot.get("error"):
             return {"error": shot["error"]}
         info = rexweb("/info", pane)

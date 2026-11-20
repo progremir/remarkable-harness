@@ -128,9 +128,10 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Tap to click. Drag to scroll; the page moves when the finger lifts.
   - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
   - A bar above the page has back, forward and reload buttons and the address. Tap the address to go somewhere else.
-  - **A-** and **A+** in the bar change the page's text size in steps of 25%. The change is kept in `/home/root/.config/rexpaper/webzoom`. A pane that Rex on the Mac is also showing is zoomed there too, because both show the same page.
+  - A page is laid out for the tablet pane's own size while the tablet shows it, as a terminal is resized for the device looking at it. Rex on the Mac then shows the same page scaled to fit its pane. About 20 seconds after the tablet leaves the tab, the Mac gets its own size back.
+  - **A-** and **A+** in the bar change the text size in steps of 25%, by laying the page out for a smaller or bigger screen. The choice is kept in `/home/root/.config/rexpaper/webzoom`.
   - **Open browser tab** in the menu opens a browser in a tab of its own and shows it full screen.
-  - A browser pane that Rex on the Mac isn't showing is laid out at the tablet's size. This needs one added route in rexweb (the patch also stops rexweb moving a pane into the Settings window): apply `rexpaper/mac/rexweb.patch` in your rexweb checkout and run its `install.sh`. Without it such a pane is 800 by 540 and fills only a corner.
+  - Sizing needs changes to rexweb: apply `rexpaper/mac/rexweb.patch` in your rexweb checkout and run its `install.sh`. The patch also makes room for Rex's sidebar and keeps panes out of the Settings window. Without it the tablet shows the page as the Mac has it.
   - The client never claims or sizes a browser pane's terminal. rexweb draws a pane on the Mac when any device has, even over a window that isn't showing its tab.
   - The menu has the same four as **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
   - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane. A pane in a tab that Rex on the Mac isn't showing keeps rexweb's default size, 800 by 540: wide and short, so it fills only the top of a tall pane.
