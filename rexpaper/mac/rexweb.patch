@@ -1,8 +1,19 @@
 diff --git a/Sources/RexWeb.swift b/Sources/RexWeb.swift
-index 74497c2..9405491 100644
+index 74497c2..1f9fe23 100644
 --- a/Sources/RexWeb.swift
 +++ b/Sources/RexWeb.swift
-@@ -821,17 +821,29 @@ final class Tracker {
+@@ -117,7 +117,9 @@ enum RexChrome {
+       i.floatTop = 38
+       let collapsed = (value("sidebarCollapsed") as? NSNumber)?.boolValue ?? false
+       if !collapsed {
+-        let w = (value("sidebarWidth") as? NSNumber)?.doubleValue ?? 0
++        // Local addition: Rex only saves the width once the sidebar has been
++        // dragged. Until then it is 240 points wide.
++        let w = (value("sidebarWidth") as? NSNumber)?.doubleValue ?? 240
+         if value("sidebarPosition") as? String == "right" { i.right = w; i.floatRight = w } else { i.left = w; i.floatLeft = w; i.floatTop = 0 }
+       }
+     }
+@@ -821,17 +823,29 @@ final class Tracker {
    func window(for p: Panel, _ place: (rect: CGRect, floating: Bool), _ v: [String: Any], _ rexWins: [RexWindow], _ primaryHeight: CGFloat) -> RexWindow? {
      let label = v["label"] as? String ?? ""
      if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
@@ -38,7 +49,7 @@ index 74497c2..9405491 100644
    }
  
    static func body(_ frac: CGRect, floating: Bool, in b: CGRect, _ ins: Insets) -> (body: CGRect, radius: Double) {
-@@ -1313,6 +1325,20 @@ final class App: NSObject, NSApplicationDelegate {
+@@ -1313,6 +1327,20 @@ final class App: NSObject, NSApplicationDelegate {
      switch route {
      case "/info":
        ok(p.info())
