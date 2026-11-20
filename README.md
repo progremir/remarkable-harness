@@ -103,7 +103,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
 - **A tab** shows its panes split the way they are on the Mac:
   - Tap a pane to type into it. Its title strip turns black.
   - Drag a finger to scroll back.
-  - The key row has Esc, Tab, Ctrl, ^C, the arrows and Enter, for use without a keyboard. **Ctrl** applies to the next key.
+  - The key row has Esc, Tab, Ctrl, ^C, the arrows, Space and Enter, for use without a keyboard. **Ctrl** applies to the next key.
   - **< Sessions** in the bar goes back to the list.
 - **Menu** (the last key of the row):
   - **New tab**, **Split right**, **Split down**, **Close this pane**, **Rename tab**.
@@ -119,6 +119,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - The ink goes away when its text is typed, with a slow refresh that leaves no ghost of it.
   - The eraser end of the pen rubs out scribbles, a stroke at a time. Rubbing out everything that is being read cancels it, and nothing is typed.
   - With no scribbles on screen, the eraser deletes typed text from the cursor backwards: one character for each character's width you rub across, and one for a dab.
+  - Spaces: the reader sees the line up to the cursor. It puts a space before a new word that follows a word, and none before punctuation, a file extension or the rest of a path. For a space by itself, tap **Space**, or draw the space sign: a flat line with both ends turned up.
   - A mark on its own is read as punctuation or a symbol: a dot, a comma, a dash, a slash and so on.
   - The reader keeps its last 20 pictures and a log of what it made of them in `~/.config/rexpaper/scribe/` on the Mac, to see why a reading went wrong.
   - A finger still scrolls and taps. The pen taps the key row, the bar and the menus.

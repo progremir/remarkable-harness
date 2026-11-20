@@ -5,7 +5,8 @@ The client starts this in a terminal block of its own on the Rex server's
 machine and talks to it through that terminal:
 
   client -> scribe   one JSON object per line, typed into the terminal:
-                     {"id": 7, "strokes": [[x, y, x, y, ...], ...]}
+                     {"id": 7, "strokes": [[x, y, x, y, ...], ...],
+                      "before": "the line up to the cursor"}
   scribe -> client   a line on the screen for each one:
                      @@scribe {"id": 7, "text": "ls -la"}@@
                      and the terminal's title set to "scribe done 7", which
@@ -19,6 +20,7 @@ Claude reads the strokes, through the Claude Code login on this machine
 import base64
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -37,6 +39,8 @@ Rules:
 - Reply with the text they wrote and nothing else: no quotes around it, no explanation, no markdown.
 - Keep their words, case, digits, punctuation and symbols such as - / . ~ | > & $ exactly. Prefer the reading that makes sense as a command or sentence: `ls -la`, not `1s -1a`.
 - Several handwritten lines are one text: join them with single spaces.
+- Spaces at the ends matter, and you write one as <space>. The note with each picture quotes what is already on the line, up to the cursor. Start your reply with <space> when the new writing is a new word after a word that is already there: `git` on the line and `status` written gives `<space>status`. Give no <space> when the line is empty or already ends in a space (a shell prompt such as `% ` or `$ ` ends in one), or when the writing carries on what is there: punctuation after a word, a file extension, the rest of a path, the rest of a word.
+- If they draw the space sign, a flat line with both ends turned up like a tray, reply with exactly <space>.
 - If they finish with a return arrow (a bent arrow like the Enter key) or underline the whole text twice, they want it submitted: end your reply with <enter>.
 - A lone return arrow means just <enter>.
 - A small mark on its own is punctuation or a symbol, and they mean it: a dot is `.`, a dot with a tail is `,`, a short flat line is `-`, a long flat line is `_`, a leaning line is `/` or `\\`, an upright line as tall as a letter is `|`, an upright line over a dot is `!`, a hook over a dot is `?`, two dots are `:`, a dot over a tail is `;`, one or two short ticks are `'` or `"`, and so on for `* ~ = + < > ( ) [ ] { } # @ $ % & ^`. Give your best reading of a single mark. Never call a clear mark unreadable.
@@ -152,6 +156,8 @@ def tidy(answer):
         return ""
     enter = text.endswith("<enter>")
     text = text.removesuffix("<enter>").rstrip()
+    # <space> stands for a space that the collapsing above would have lost.
+    text = re.sub(r" ?<space> ?", " ", text)
     return text + ("\r" if enter else "")
 
 
@@ -202,7 +208,8 @@ def main():
         if w > 2.5 * h and h > 12:  # a word or more: its height is the height of a line of writing
             letter = 0.7 * letter + 0.3 * (h * 0.6)
         note = (f"(handwriting; the ink is {w:.0f} x {h:.0f} pixels, "
-                f"and their lower-case letters are about {letter:.0f} pixels tall)")
+                f"and their lower-case letters are about {letter:.0f} pixels tall; "
+                f"the line up to the cursor is {json.dumps(str(msg.get('before', '')))})")
         png = strokes_png(strokes)
         try:
             answer = reader.read(png, note)

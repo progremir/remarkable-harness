@@ -487,7 +487,7 @@ enum KeyBtn {
     Menu,
 }
 
-const KEY_ROW: [(&str, KeyBtn); 10] = [
+const KEY_ROW: [(&str, KeyBtn); 11] = [
     ("Esc", KeyBtn::Key(KeyAction::Esc)),
     ("Tab", KeyBtn::Key(KeyAction::Tab)),
     ("Ctrl", KeyBtn::Ctrl),
@@ -496,6 +496,7 @@ const KEY_ROW: [(&str, KeyBtn); 10] = [
     ("\u{2193}", KeyBtn::Key(KeyAction::Down)),
     ("\u{2191}", KeyBtn::Key(KeyAction::Up)),
     ("\u{2192}", KeyBtn::Key(KeyAction::Right)),
+    ("Space", KeyBtn::Key(KeyAction::Char(' '))),
     ("Enter", KeyBtn::Key(KeyAction::Enter)),
     ("Menu", KeyBtn::Menu),
 ];
@@ -2143,7 +2144,18 @@ impl App {
             .iter()
             .map(|s| s.iter().flat_map(|p| [p.0, p.1]).collect())
             .collect();
-        let line = format!("{}\n", json!({"id": id, "strokes": strokes}));
+        // What is on the line already, so the reader can tell whether the
+        // writing starts a new word and needs a space before it.
+        let before = match self.focused_term() {
+            Some((tv, _, _)) => {
+                let at = tv.term.grid().cursor.point;
+                let text: String = (0..at.column.0).map(|c| tv.term.grid()[at.line][Column(c)].c).collect();
+                let n = text.chars().count();
+                text.chars().skip(n.saturating_sub(160)).collect()
+            }
+            None => String::new(),
+        };
+        let line = format!("{}\n", json!({"id": id, "strokes": strokes, "before": before}));
         self.ink.sent = std::mem::take(&mut self.ink.strokes);
         self.ink.waiting = Some((id, Instant::now()));
         let Some(sc) = self.scribe.as_mut() else {
