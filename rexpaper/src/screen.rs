@@ -56,6 +56,13 @@ impl Screen {
         }
     }
 
+    /// A slow refresh that leaves no ghosts, such as of erased ink.
+    pub fn deghost(&self) {
+        if let Screen::Qtfb(c) = self {
+            let _ = c.request_full_refresh();
+        }
+    }
+
     /// `fast` trades some ghosting for the quickest refresh, for ink.
     pub fn set_fast(&self, fast: bool) {
         if let Screen::Qtfb(c) = self {

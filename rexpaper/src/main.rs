@@ -514,6 +514,12 @@ struct Ink {
     next_id: u64,
     /// The pen is pressing a button, not writing.
     tapping: Option<(i32, i32)>,
+    /// The eraser is down: where it was last, the left and right ends of
+    /// its rub, how many typed characters the rub has deleted, and whether
+    /// it has rubbed out any ink.
+    erasing: Option<((i32, i32), i32, i32, usize, bool)>,
+    /// Ink was removed: the next full refresh also clears its ghosts.
+    deghost: bool,
 }
 
 /// The terminal block on the server's machine that reads handwriting.
@@ -1958,12 +1964,15 @@ impl App {
             qtfb::InputEvent { input_type, dev_id: PEN_TAP, x: px as i32, y: py as i32, d: 0 }
         };
         match ev {
-            PenEv::Down(px, py) => {
+            PenEv::Down(px, py, eraser) => {
                 let p = at(px, py);
                 let writes = self.overlay.is_none()
                     && matches!(&self.view, View::Win(wv) if !wv.select)
                     && (p.1 as usize) < g.keys_y;
-                if writes {
+                if writes && eraser {
+                    self.ink.erasing = Some((p, p.0, p.0, 0, false));
+                    self.erase(p);
+                } else if writes {
                     if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
                         self.screen.set_fast(true);
                     }
@@ -1982,6 +1991,8 @@ impl App {
                     self.ink.tapping = Some(p);
                     let e = tap(qtfb::INPUT_PEN_UPDATE, p);
                     self.touch(e);
+                } else if self.ink.erasing.is_some() {
+                    self.erase(p);
                 } else if self.ink.down {
                     let Some(last) = self.ink.strokes.last().and_then(|s| s.last().copied()) else {
                         return;
@@ -1996,6 +2007,12 @@ impl App {
                 if let Some(p) = self.ink.tapping.take() {
                     let e = tap(qtfb::INPUT_PEN_RELEASE, p);
                     self.touch(e);
+                } else if let Some((_, _, _, deleted, inked)) = self.ink.erasing.take() {
+                    // A dab with the eraser deletes one character.
+                    if deleted == 0 && !inked && self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
+                        self.type_bytes(vec![0x7f]);
+                    }
+                    self.ink.last_up = Some(Instant::now());
                 } else if self.ink.down {
                     self.ink.down = false;
                     self.ink.last_up = Some(Instant::now());
@@ -2004,10 +2021,60 @@ impl App {
         }
     }
 
+    /// The eraser moved to `p`. While there are scribbles it rubs them
+    /// out, a stroke at a time. With none, it deletes typed text from the
+    /// cursor backwards: one character for each cell's width it rubs over.
+    fn erase(&mut self, p: (i32, i32)) {
+        let Some((last, lo, hi, deleted, inked)) = self.ink.erasing else {
+            return;
+        };
+        let (lo, hi) = (lo.min(p.0), hi.max(p.0));
+        self.ink.erasing = Some((p, lo, hi, deleted, inked));
+        if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
+            if inked {
+                return; // this rub was for ink, and has just finished it off
+            }
+            let cw = self.fonts[self.font_ix].width as i32;
+            let want = ((hi - lo) / cw) as usize;
+            if want > deleted {
+                self.type_bytes(vec![0x7f; want - deleted]);
+                self.ink.erasing = Some((p, lo, hi, want, false));
+            }
+            return;
+        }
+        // A stroke goes when the eraser's path comes near any of its points.
+        const REACH: i32 = 30;
+        let n = ((p.0 - last.0).abs().max((p.1 - last.1).abs()) / 10).max(1);
+        let path: Vec<(i32, i32)> =
+            (0..=n).map(|k| (last.0 + (p.0 - last.0) * k / n, last.1 + (p.1 - last.1) * k / n)).collect();
+        let hit = |s: &Vec<(i32, i32)>| {
+            s.iter().any(|q| path.iter().any(|e| (q.0 - e.0).pow(2) + (q.1 - e.1).pow(2) <= REACH * REACH))
+        };
+        let before = self.ink.strokes.len() + self.ink.sent.len();
+        self.ink.strokes.retain(|s| !hit(s));
+        self.ink.sent.retain(|s| !hit(s));
+        if self.ink.strokes.len() + self.ink.sent.len() == before {
+            return;
+        }
+        self.ink.erasing = Some((p, lo, hi, deleted, true));
+        self.ink.deghost = true;
+        if self.ink.sent.is_empty() && self.ink.waiting.take().is_some() {
+            // Everything sent off was rubbed out: its text is not wanted.
+            self.banner = None;
+        }
+        if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
+            self.screen.set_fast(false);
+        }
+        if let View::Win(wv) = &mut self.view {
+            wv.repaint = true;
+        }
+    }
+
     /// Throw the ink away and show the screen without it.
     fn clear_ink(&mut self, all: bool) {
         self.ink.sent.clear();
         self.ink.waiting = None;
+        self.ink.deghost = true;
         if all {
             self.ink.strokes.clear();
         }
@@ -2970,6 +3037,7 @@ fn run() -> std::io::Result<()> {
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| serde_json::from_str(&t).ok());
+    let erase_test = std::env::var("REXPAPER_INK_ERASER").is_ok();
     let ink_at = env_secs("REXPAPER_INK_AT").unwrap_or(Duration::from_secs(3));
     let mut keyboards = evkbd::Keyboards::new(true);
     let mut last_kbd_scan: Option<Instant> = None;
@@ -2989,6 +3057,9 @@ fn run() -> std::io::Result<()> {
         if app.settle_at.is_some_and(|at| Instant::now() >= at) {
             app.settle_at = None;
             app.show_all();
+            if std::mem::take(&mut app.ink.deghost) {
+                app.screen.deghost();
+            }
         }
 
         // While the tablet sleeps the wall clock runs and this one doesn't.
@@ -3094,7 +3165,7 @@ fn run() -> std::io::Result<()> {
         if started.elapsed() >= ink_at {
             for stroke in ink_test.take().unwrap_or_default() {
                 for (i, p) in stroke.iter().enumerate() {
-                    app.pen(if i == 0 { PenEv::Down(p.0, p.1) } else { PenEv::Move(p.0, p.1) });
+                    app.pen(if i == 0 { PenEv::Down(p.0, p.1, erase_test) } else { PenEv::Move(p.0, p.1) });
                 }
                 app.pen(PenEv::Up);
             }

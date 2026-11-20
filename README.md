@@ -116,6 +116,9 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - For AppLoad's keyboard, swipe down from the top edge and tap the keyboard button at the top left. On the first key, the terminals and the bar move up to leave room for it. When you close the keyboard, choose **Use the whole screen** in the menu.
 - **Handwriting:** write on a tab with the pen, anywhere over the terminals. About a second after you lift the pen, the ink is read and typed at the cursor of the pane you are in.
   - The text is not submitted. To submit it, end with a return arrow (the bent arrow on an Enter key), or tap **Enter**.
+  - The ink goes away when its text is typed, with a slow refresh that leaves no ghost of it.
+  - The eraser end of the pen rubs out scribbles, a stroke at a time. Rubbing out everything that is being read cancels it, and nothing is typed.
+  - With no scribbles on screen, the eraser deletes typed text from the cursor backwards: one character for each character's width you rub across, and one for a dab.
   - A finger still scrolls and taps. The pen taps the key row, the bar and the menus.
   - Claude reads the ink on the Mac, through its Claude Code login, so `claude` must be installed there. It takes 3 to 5 seconds. `SCRIBE_MODEL` in the Mac's shell profile picks the model (default `sonnet`).
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
@@ -154,14 +157,15 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   | `REXPAPER_TYPE=<text>`, `REXPAPER_TYPE_AT=<seconds>` | Types the text, 2 seconds in unless told otherwise. |
   | `REXPAPER_TAPS="3:1540,2050 4:10,80-300,80"` | Taps and drags at times, in canvas pixels. |
   | `REXPAPER_ROT=<0-3>`, `REXPAPER_KBD=1` | Starts turned, or with room left for the keyboard. |
-  | `REXPAPER_INK=strokes.json`, `REXPAPER_INK_AT=<seconds>` | Writes those strokes with the pen: `[[[x, y], ...], ...]`. |
+  | `REXPAPER_INK=strokes.json`, `REXPAPER_INK_AT=<seconds>` | Writes those strokes with the pen: `[[[x, y], ...], ...]`. With `REXPAPER_INK_ERASER=1`, with its eraser end. |
   | `REXPAPER_DROP_AT=<seconds>` | Drops the connection, to see it come back. |
   | `REXPAPER_INJECT=<json>` | Handles a control message as if the server sent it. |
   | `REXPAPER_EXIT_AFTER=<seconds>` | Ends the run. |
 - **Limits:**
   - Floating layers are not shown. The bar says how many a tab has.
   - A block that is not a terminal shows a few lines about itself instead of its content.
-  - Handwriting can't be cancelled once the pen has rested, and the picture of it goes to Claude.
+  - The picture of your handwriting goes to Claude.
+  - The eraser deletes with Backspace, so it can't reach text that was already submitted.
   - Copied text stays on the tablet: Rex has no call that sets the Mac's clipboard.
   - Rotation and waking from sleep were tested only in headless runs, and the Type Folio only with a virtual keyboard.
 - **Credits:** the renderer, keyboard and rotation code come from PaperTerm (MIT, `LICENSE.paperterm`). The fonts are Spleen (`fonts/LICENSE.spleen`). `tools/mkicon.py` draws the icon.

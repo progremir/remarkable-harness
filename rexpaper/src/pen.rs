@@ -8,8 +8,8 @@ use crate::render::{SCREEN_H, SCREEN_W};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PenEv {
-    /// Screen pixels, before rotation.
-    Down(i32, i32),
+    /// Screen pixels, before rotation. True for the eraser end.
+    Down(i32, i32, bool),
     Move(i32, i32),
     Up,
 }
@@ -19,6 +19,7 @@ pub struct Pen {
     raw: (i32, i32),
     touching: bool,
     was_touching: bool,
+    rubber: bool,
     last: (i32, i32),
 }
 
@@ -39,7 +40,7 @@ impl Pen {
             let path = std::ffi::CString::new(format!("/dev/input/{name}")).ok()?;
             let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
             if fd >= 0 {
-                return Some(Pen { fd, raw: (0, 0), touching: false, was_touching: false, last: (-1, -1) });
+                return Some(Pen { fd, raw: (0, 0), touching: false, was_touching: false, rubber: false, last: (-1, -1) });
             }
         }
         None
@@ -67,10 +68,11 @@ impl Pen {
                     (3, 0) => self.raw.0 = value,
                     (3, 1) => self.raw.1 = value,
                     (1, 0x14a) => self.touching = value != 0, // BTN_TOUCH
+                    (1, 0x141) => self.rubber = value != 0,   // BTN_TOOL_RUBBER
                     (0, 0) => {
                         let p = (self.raw.0 * (pw - 1) / PEN_MAX.0, self.raw.1 * (ph - 1) / PEN_MAX.1);
                         match (self.was_touching, self.touching) {
-                            (false, true) => out.push(PenEv::Down(p.0, p.1)),
+                            (false, true) => out.push(PenEv::Down(p.0, p.1, self.rubber)),
                             (true, true) if p != self.last => out.push(PenEv::Move(p.0, p.1)),
                             (true, false) => out.push(PenEv::Up),
                             _ => {}
