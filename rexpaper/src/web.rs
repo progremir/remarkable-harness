@@ -18,6 +18,7 @@ pub const SCREEN: &str = "rexweb \u{b7}";
 pub const BAR_H: usize = 60;
 const BTN_W: usize = 84;
 const RELOAD_W: usize = 124;
+const ZOOM_W: usize = 76;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BarHit {
@@ -25,6 +26,8 @@ pub enum BarHit {
     Forward,
     Reload,
     Address,
+    Smaller,
+    Bigger,
 }
 
 /// The part of a browser pane that shows the page.
@@ -32,14 +35,16 @@ pub fn page_rect(r: Rect) -> Rect {
     Rect::new(r.x, r.y + BAR_H, r.w, r.h.saturating_sub(BAR_H))
 }
 
-fn bar_parts(r: Rect) -> [(BarHit, Rect); 4] {
+fn bar_parts(r: Rect) -> [(BarHit, Rect); 6] {
     let h = BAR_H - 2;
     let left = 2 * BTN_W + RELOAD_W;
     [
         (BarHit::Back, Rect::new(r.x, r.y, BTN_W, h)),
         (BarHit::Forward, Rect::new(r.x + BTN_W, r.y, BTN_W, h)),
         (BarHit::Reload, Rect::new(r.x + 2 * BTN_W, r.y, RELOAD_W, h)),
-        (BarHit::Address, Rect::new(r.x + left, r.y, r.w.saturating_sub(left), h)),
+        (BarHit::Address, Rect::new(r.x + left, r.y, r.w.saturating_sub(left + 2 * ZOOM_W), h)),
+        (BarHit::Smaller, Rect::new(r.x + r.w.saturating_sub(2 * ZOOM_W), r.y, ZOOM_W, h)),
+        (BarHit::Bigger, Rect::new(r.x + r.w.saturating_sub(ZOOM_W), r.y, ZOOM_W, h)),
     ]
 }
 
@@ -139,6 +144,8 @@ impl WebView {
                 BarHit::Back => ui::button(fb, font, b, "\u{2190}", false),
                 BarHit::Forward => ui::button(fb, font, b, "\u{2192}", false),
                 BarHit::Reload => ui::button(fb, font, b, "Reload", false),
+                BarHit::Smaller => ui::button(fb, font, b, "A-", false),
+                BarHit::Bigger => ui::button(fb, font, b, "A+", false),
                 BarHit::Address => {
                     let text = if self.url.is_empty() { "Tap to enter an address" } else { &self.url };
                     ui::line(fb, font, b, text, false);

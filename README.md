@@ -128,6 +128,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Tap to click. Drag to scroll; the page moves when the finger lifts.
   - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
   - A bar above the page has back, forward and reload buttons and the address. Tap the address to go somewhere else.
+  - **A-** and **A+** in the bar make the page's text smaller or bigger, in steps of 25%. It starts at 150% and is kept in `/home/root/.config/rexpaper/webzoom`. The page is zoomed on the Mac too, because both show the same page.
   - The menu has the same four as **Go to address**, **Page back**, **Page forward** and **Reload page**. **Open browser pane** puts a new one beside the pane you are in.
   - It needs rexweb installed on the Mac. The page is drawn there, at the size its pane has in Rex on the Mac, and scaled to the tablet's pane. A pane in a tab that Rex on the Mac isn't showing keeps rexweb's default size, 800 by 540: wide and short, so it fills only the top of a tall pane.
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.

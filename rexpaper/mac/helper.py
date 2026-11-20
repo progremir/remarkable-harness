@@ -207,9 +207,11 @@ EDITABLE = """((el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAREA
 
 # A pane that Rex on the Mac isn't showing keeps rexweb's small default size,
 # about 400 CSS pixels wide, and a page laid out for that is all headline on
-# the tablet. Halving the page's zoom lays it out as for 800.
+# the tablet. Halving the page's zoom lays it out as for 800. The tablet also
+# asks for its own zoom, as a percentage, because its pixels are small.
 JS_STATE = f"""(() => {{
-  const root = document.documentElement, want = innerWidth < 500 ? '0.5' : '';
+  const zoom = (innerWidth < 500 ? 0.5 : 1) * __ZOOM__ / 100;
+  const root = document.documentElement, want = zoom === 1 ? '' : String(zoom);
   if (root && root.style.zoom !== want) root.style.zoom = want;
   return {{vw: innerWidth, vh: innerHeight, y: Math.round(scrollY),
   full: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0),
@@ -280,7 +282,8 @@ def web(msg):
     if op == "shot":
         tag = "".join(c for c in block[-8:] if c.isalnum())
         png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
-        state = rexweb("/eval", dict(pane, js=JS_STATE)).get("value") or {}
+        zoom = max(25, min(400, int(msg.get("zoom") or 100)))
+        state = rexweb("/eval", dict(pane, js=JS_STATE.replace("__ZOOM__", str(zoom)))).get("value") or {}
         shot = rexweb("/shot", dict(pane, path=png))
         if shot.get("error"):
             return {"error": shot["error"]}

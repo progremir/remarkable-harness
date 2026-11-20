@@ -459,6 +459,7 @@ enum Act {
     /// Go to an address in the browser pane; back, forward or reload.
     WebGo,
     WebNav(&'static str),
+    WebZoom(i32),
     /// Open a browser pane beside this pane.
     Browser,
     /// Answer a prompt that an action on the server raised.
@@ -598,6 +599,8 @@ struct App {
     rot: Rot,
     fonts: Vec<Psf2Font>,
     font_ix: usize,
+    /// How much bigger than on the Mac a page's text is shown, in percent.
+    web_zoom: u32,
     ui: Psf2Font,
     big: Psf2Font,
     palette: palette::Palette,
@@ -1584,6 +1587,8 @@ impl App {
                 it("Page back", Act::WebNav("back")),
                 it("Page forward", Act::WebNav("forward")),
                 it("Reload page", Act::WebNav("reload")),
+                it("Page text bigger", Act::WebZoom(1)),
+                it("Page text smaller", Act::WebZoom(-1)),
             ]);
         }
         items.extend([
@@ -1789,6 +1794,21 @@ impl App {
                 (Act::WebGo, Some(Answer::Text(url))) => {
                     let bid = focus_bid.ok_or("no pane")?;
                     self.web_act(&bid, json!({"web": "nav", "url": url}));
+                }
+                (Act::WebZoom(step), _) => {
+                    let zoom = (self.web_zoom as i32 + step * 25).clamp(50, 300) as u32;
+                    if zoom != self.web_zoom {
+                        self.web_zoom = zoom;
+                        let _ = std::fs::write(format!("{CONFIG_DIR}/webzoom"), zoom.to_string());
+                        if let View::Win(wv) = &mut self.view {
+                            for p in wv.panes.iter_mut() {
+                                if let Body::Web(wb) = &mut p.body {
+                                    wb.next_shot = Instant::now();
+                                }
+                            }
+                        }
+                        self.say(&format!("Page text at {zoom}%"));
+                    }
                 }
                 (Act::WebNav(op), _) => {
                     let bid = focus_bid.ok_or("no pane")?;
@@ -1997,7 +2017,7 @@ impl App {
                                 Some(web::BarHit::Back) => Some(json!({"web": "back"})),
                                 Some(web::BarHit::Forward) => Some(json!({"web": "forward"})),
                                 Some(web::BarHit::Reload) => Some(json!({"web": "reload"})),
-                                Some(web::BarHit::Address) => None,
+                                Some(web::BarHit::Address | web::BarHit::Smaller | web::BarHit::Bigger) => None,
                                 None if tap => wb
                                     .page_point(x0, y0, web::page_rect(area))
                                     .map(|(px, py)| json!({"web": "tap", "x": px, "y": py})),
@@ -2006,8 +2026,13 @@ impl App {
                             wv.drag = None;
                             if let Some(act) = act {
                                 self.web_act(&bid, act);
-                            } else if bar == Some(web::BarHit::Address) {
-                                self.perform(Act::WebGo, None);
+                            } else {
+                                match bar {
+                                    Some(web::BarHit::Address) => self.perform(Act::WebGo, None),
+                                    Some(web::BarHit::Smaller) => self.perform(Act::WebZoom(-1), None),
+                                    Some(web::BarHit::Bigger) => self.perform(Act::WebZoom(1), None),
+                                    _ => {}
+                                }
                             }
                         }
                         return;
@@ -3022,7 +3047,7 @@ impl App {
             }
         }
         for (bid, w, last) in shots {
-            let asked = self.ask_helper(json!({"web": "shot", "block": bid, "w": w, "last": last}), Want::Shot(bid.clone()));
+            let asked = self.ask_helper(json!({"web": "shot", "block": bid, "w": w, "last": last, "zoom": self.web_zoom}), Want::Shot(bid.clone()));
             if let (Err(e), Some((_, wb))) = (asked, self.web_pane(&bid)) {
                 wb.busy = false;
                 wb.error = Some(format!("Can't show this page: {e}"));
@@ -3595,6 +3620,7 @@ fn run() -> std::io::Result<()> {
         rot: Rot(0),
         fonts,
         font_ix,
+        web_zoom: setting("webzoom").and_then(|z| z.parse().ok()).unwrap_or(150).clamp(50, 300),
         ui: parse(FONTS[1].1)?,
         big: parse(FONTS[2].1)?,
         palette: palette::Palette::new(),
