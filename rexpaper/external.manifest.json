@@ -1,0 +1,10 @@
+{
+  "name": "Rex",
+  "application": "run.sh",
+  "qtfb": true,
+  "supportsVirtualKeyboard": true,
+  "supportsRotation": true,
+  "environment": {
+    "RUST_BACKTRACE": "1"
+  }
+}

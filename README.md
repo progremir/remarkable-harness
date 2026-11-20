@@ -20,6 +20,7 @@ Scripts run on the Mac and reach the tablet with `ssh rm`.
 | Mac Screen | Shows one Mac window on the tablet over Tailscale. One finger moves the pointer, two fingers scroll. Rotation resizes the Mac window. It also forwards the keyboard. | [`macscreen/`](macscreen) |
 | Diary | A page that writes back. Write with the pen and pause; your ink dissolves, Claude reads it, and the answer is written out with a quill and then fades. It also has a notebook mode that keeps the ink. | [`diary/`](diary) |
 | PaperTerm | Terminal, based on [MaximeRivest/paperterm](https://github.com/MaximeRivest/paperterm). Adds Type Folio keyboard input through evdev, rotation and faster typing. | [`paperterm/`](paperterm) |
+| Rex | Client for a [Rex](https://www.superlogical.com/rex/docs) server. Lists the server's sessions and tabs, shows a tab with its split panes, types into them, and makes, renames and closes them, over Tailscale. | [`rexpaper/`](rexpaper) |
 
 ### Third-party
 
@@ -60,6 +61,7 @@ You can rebuild the custom parts from this repo. The results of these checks on 
 | Diary, tablet | `diary/tablet/install.sh` | Builds the app and installs it in AppLoad. |
 | Diary, Mac | `diary/mac/start.sh` | Starts the server that asks Claude. It must be running while you use the app. |
 | PaperTerm | `paperterm/install.sh` | Clones upstream, applies the changes, builds and installs. |
+| Rex | `rexpaper/install.sh [server]` | Builds the client and installs it in AppLoad. `server` is the Rex server's Tailscale name. |
 
 Rust parts need `rustup target add aarch64-unknown-linux-gnu`, `cargo-zigbuild` and `zig`.
 
@@ -86,6 +88,75 @@ The Mac app is signed with the keychain certificate "rmscreen local signing", so
 - **Test clients:**
   - `macscreen/mac/test_client.py` and `test_list.py` connect to the server locally.
   - `tools/fb2png.py` turns an app's framebuffer (`/dev/shm/qtfb_*`, RGB565) into a PNG, so you can see what an app draws without taking a screenshot.
+
+## Rex details
+
+Rex is a server that runs terminals and keeps them running. The Mac app and the `rex` command are clients of it, and `rexpaper/` is one more client, for the tablet.
+
+Open **Rex** in AppLoad. It lists every session on the server and the tabs in each one, with a mark such as `[working]` or `[blocked]` for programs that report their status. Port forwards and detached blocks are listed under their session.
+
+- **The list:**
+  - Tap a tab to open it.
+  - Tap a session's name for its menu: **New tab**, **Rename session**, **End session**.
+  - **+ New session** makes a session with one shell and opens it.
+  - Swipe up or down when the list is longer than the screen.
+- **A tab** shows its panes split the way they are on the Mac:
+  - Tap a pane to type into it. Its title strip turns black.
+  - Drag a finger to scroll back.
+  - The key row has Esc, Tab, Ctrl, ^C, the arrows and Enter, for use without a keyboard. **Ctrl** applies to the next key.
+  - **< Sessions** in the bar goes back to the list.
+- **Menu** (the last key of the row):
+  - **New tab**, **Split right**, **Split down**, **Close this pane**, **Rename tab**.
+  - **Zoom this pane** fills the screen with one pane, and **Show all panes** undoes it.
+  - **Select text**, then drag over the text, copies it. **Paste** types it into the pane. Text copied in a Rex terminal on the Mac can be pasted too.
+  - **Smaller text** and **Larger text** switch between three sizes. The choice is kept.
+  - **Refresh screen** reads the terminals again and redraws everything.
+- **Keyboards:**
+  - The Type Folio works as it is.
+  - For AppLoad's keyboard, swipe down from the top edge and tap the keyboard button at the top left. On the first key, the terminals and the bar move up to leave room for it. When you close the keyboard, choose **Use the whole screen** in the menu.
+- **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
+- **Set-up:**
+  - On the Mac, turn on Tailscale for the Rex server and read its name from `rex server status` (the `tailscale:` line).
+  - Run `rexpaper/install.sh that-name.ts.net`. The name is kept on the tablet in `/home/root/.config/rexpaper/server`.
+- **How it works:**
+  - It connects through `tailscale nc` to port 443 of the server and speaks TLS and WebSocket itself (`src/wire.rs`).
+  - Commands and events are JSON on the control connection, `/api/control` (`src/rex.rs`).
+  - Each terminal on screen has a data connection, `/api/data`, that streams its output (`src/stream.rs`). The stream starts with a snapshot in Ghostty's format, which this client can't read. It skips the snapshot and asks for the screen as escape sequences with `com.superlogical.terminal.format`.
+  - That read races with the stream, so the client reads the screen once more when the terminal goes quiet.
+  - The output feeds the same emulator and e-ink renderer as PaperTerm. Keys go back with `com.superlogical.terminal.write`.
+  - The server documents this protocol itself: `curl --unix-socket ~/Library/Application\ Support/rex/server.sock http://rex/llms.txt`.
+- **Size:** opening a tab claims its terminals (`session.own_block`) and sizes each one to its pane on the tablet. The Mac app then shows them at that size. When another device takes one back, the bar says so, and the tablet shows that terminal's left columns and last rows. Tap the bar to fit them to the tablet again. Leaving the tab hands them back.
+- **Connection:** the client pings the server every 20 seconds. When the connection drops, or the tablet wakes from sleep, it connects again by itself and reopens the tab you were in.
+- **Settings:** each is an environment variable in the app's `run.sh`, or a file of the same name, in lower case and without the prefix, in `/home/root/.config/rexpaper/`.
+  - `REXPAPER_SERVER`: the server. `host[:port]` goes through `tailscale nc`, `tls://host[:port]` connects directly, `unix:/path` uses a local socket.
+  - `REXPAPER_FONT`: `12x24`, `16x32` (default) or `32x64`. The menu writes this file.
+  - `REXPAPER_KIND`: set it to `app` to receive the questions that actions in Rex's `init.lua` ask with `rex.ui`. The tablet then shows them and sends your answer. It is off by default, because the `rex` command picks "the app" by itself only while one app is connected. With the tablet as a second app, commands that act on a client need `-C`.
+- **Try it without the tablet:** `REXPAPER_HEADLESS=frame.raw` draws into a file that `tools/fb2png.py` turns into a PNG, and writes the focused terminal's text to `frame.raw.txt`. For example, on the Mac:
+
+  ```sh
+  cd rexpaper && cargo build
+  REXPAPER_SERVER="unix:$HOME/Library/Application Support/rex/server.sock" \
+    REXPAPER_HEADLESS=/tmp/frame.raw REXPAPER_EXIT_AFTER=2 target/debug/rexpaper
+  python3 -I ../tools/fb2png.py /tmp/frame.raw /tmp/frame.png 2
+  ```
+
+  These variables drive a headless run:
+
+  | Variable | Effect |
+  |---|---|
+  | `REXPAPER_OPEN=<end of a block ID>` | Opens that terminal's tab. |
+  | `REXPAPER_TYPE=<text>`, `REXPAPER_TYPE_AT=<seconds>` | Types the text, 2 seconds in unless told otherwise. |
+  | `REXPAPER_TAPS="3:1540,2050 4:10,80-300,80"` | Taps and drags at times, in canvas pixels. |
+  | `REXPAPER_ROT=<0-3>`, `REXPAPER_KBD=1` | Starts turned, or with room left for the keyboard. |
+  | `REXPAPER_DROP_AT=<seconds>` | Drops the connection, to see it come back. |
+  | `REXPAPER_INJECT=<json>` | Handles a control message as if the server sent it. |
+  | `REXPAPER_EXIT_AFTER=<seconds>` | Ends the run. |
+- **Limits:**
+  - Floating layers are not shown. The bar says how many a tab has.
+  - A block that is not a terminal shows a few lines about itself instead of its content.
+  - Copied text stays on the tablet: Rex has no call that sets the Mac's clipboard.
+  - Rotation and waking from sleep were tested only in headless runs, and the Type Folio only with a virtual keyboard.
+- **Credits:** the renderer, keyboard and rotation code come from PaperTerm (MIT, `LICENSE.paperterm`). The fonts are Spleen (`fonts/LICENSE.spleen`). `tools/mkicon.py` draws the icon.
 
 ## Diary details
 

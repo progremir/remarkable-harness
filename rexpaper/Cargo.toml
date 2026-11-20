@@ -1,0 +1,19 @@
+[package]
+name = "rexpaper"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rex client for the reMarkable Paper Pro: browse sessions and use their terminals on e-ink"
+
+[dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
+polling = "3"
+libc = "0.2"
+signal-hook = "0.3"
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
+[profile.release]
+strip = true
+lto = true

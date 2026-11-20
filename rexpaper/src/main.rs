@@ -1,0 +1,2864 @@
+//! rexpaper — a Rex client for the reMarkable Paper Pro.
+//!
+//! Rex is a server that runs terminals; this is one more client of it. It
+//! lists the server's sessions and tabs, shows a tab with its split panes
+//! on e-ink, and types into them. The renderer, keyboard and rotation code
+//! come from PaperTerm (MaximeRivest/paperterm, MIT); the local shell is
+//! replaced by a Rex connection (see rex.rs, stream.rs, wire.rs).
+
+#[cfg(target_os = "linux")]
+mod evkbd;
+#[cfg(not(target_os = "linux"))]
+mod evkbd {
+    //! No evdev off the tablet: a keyboard set that is always empty.
+    use crate::keys::KeyAction;
+    use std::os::fd::RawFd;
+    pub struct Press {
+        pub action: KeyAction,
+        pub ctrl: bool,
+        pub alt: bool,
+    }
+    pub struct Keyboards;
+    impl Keyboards {
+        pub fn new(_grab: bool) -> Self {
+            Keyboards
+        }
+        pub fn scan(&mut self) -> Vec<RawFd> {
+            Vec::new()
+        }
+        pub fn read(&mut self, _fd: RawFd) -> (Vec<Press>, bool) {
+            (Vec::new(), true)
+        }
+        pub fn remove(&mut self, _fd: RawFd) {}
+    }
+}
+mod font;
+mod keys;
+mod orient;
+mod palette;
+mod qtfb;
+mod render;
+mod rex;
+mod screen;
+mod stream;
+mod ui;
+mod wire;
+
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::os::fd::RawFd;
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+use polling::{Event as PollEvent, Events, PollMode, Poller};
+use serde_json::{json, Value};
+
+use crate::font::Psf2Font;
+use crate::keys::KeyAction;
+use crate::orient::Rot;
+use crate::render::{TermArea, BLACK, SCREEN_H, SCREEN_W, WHITE};
+use crate::rex::{Control, Net};
+use crate::screen::Screen;
+use crate::stream::{Item, StreamFilter};
+use crate::ui::{clip, wrap, Rect};
+use crate::wire::{In, Out, Target, Wire};
+
+// The controls are at the bottom because AppLoad shows its own title bar
+// over the top when the top is touched.
+/// The status bar: back, the tab's name, and what needs attention.
+const BAR_H: usize = 64;
+/// The row of keys above the bar, for use without a keyboard.
+const KEYS_H: usize = 92;
+/// The strip that names each pane when a tab shows more than one.
+const TITLE_H: usize = 36;
+/// What AppLoad's on-screen keyboard covers at the bottom of the screen.
+const KBD_H: usize = 376;
+const ITEM_H: usize = 88;
+const MENU_W: usize = 620;
+const KBD_SCAN: Duration = Duration::from_secs(2);
+/// Poller keys at and above this belong to keyboards: key = base + fd.
+const KBD_KEY_BASE: usize = 1000;
+const CONFIG_DIR: &str = "/home/root/.config/rexpaper";
+const TERMINAL: &str = "com.superlogical.terminal";
+const SHELL: &str = "com.superlogical.terminal.shell";
+
+const FONTS: [(&str, &[u8]); 3] = [
+    ("12x24", include_bytes!("../fonts/spleen-12x24.psfu")),
+    ("16x32", include_bytes!("../fonts/spleen-16x32.psfu")),
+    ("32x64", include_bytes!("../fonts/spleen-32x64.psfu")),
+];
+
+/// The server's own emulator answers the program's queries and tracks its
+/// title, so everything our local copy would say back is dropped.
+#[derive(Clone)]
+struct Listener;
+
+impl EventListener for Listener {
+    fn send_event(&self, _event: Event) {}
+}
+
+#[derive(Copy, Clone)]
+struct GridSize {
+    cols: usize,
+    lines: usize,
+}
+
+impl Dimensions for GridSize {
+    fn total_lines(&self) -> usize {
+        self.lines
+    }
+    fn screen_lines(&self) -> usize {
+        self.lines
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+struct FdSource(RawFd);
+impl AsRawFd for FdSource {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+/// Dirty rects for one frame, in logical (canvas) coordinates. Kept apart
+/// rather than unioned: two small edits on different lines would otherwise
+/// become one large rect, which is slow to refresh on e-ink.
+#[derive(Default)]
+struct DirtyRegion {
+    rects: Vec<(usize, usize, usize, usize)>,
+}
+
+/// Above this many rects per frame, fall back to a single union.
+const MAX_RECTS: usize = 6;
+
+impl DirtyRegion {
+    fn add(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        for r in &mut self.rects {
+            if r.1 == y && r.3 == h {
+                let x0 = r.0.min(x);
+                let x1 = (r.0 + r.2).max(x + w);
+                *r = (x0, y, x1 - x0, h);
+                return;
+            }
+        }
+        self.rects.push((x, y, w, h));
+    }
+
+    fn add_rect(&mut self, r: Rect) {
+        self.add(r.x, r.y, r.w, r.h);
+    }
+
+    fn flush(&mut self, canvas: &[u8], screen: &mut Screen, rot: Rot) {
+        let mut rects = std::mem::take(&mut self.rects);
+        if rects.len() > MAX_RECTS {
+            let u = rects
+                .iter()
+                .copied()
+                .reduce(|(rx, ry, rw, rh), (x, y, w, h)| {
+                    let (x0, y0) = (rx.min(x), ry.min(y));
+                    (x0, y0, (rx + rw).max(x + w) - x0, (ry + rh).max(y + h) - y0)
+                })
+                .unwrap();
+            rects = vec![u];
+        }
+        let (lw, lh) = (render::canvas_w(), render::canvas_h());
+        for (x, y, w, h) in rects {
+            if x >= lw || y >= lh {
+                continue;
+            }
+            let (w, h) = (w.min(lw - x), h.min(lh - y));
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let (px, py, pw, ph) =
+                orient::blit(canvas, lw, screen.framebuffer(), SCREEN_W, SCREEN_H, rot, (x, y, w, h));
+            screen.update_partial(px as i32, py as i32, pw as i32, ph as i32);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- list
+
+enum RowKind {
+    Session { sid: String, label: String },
+    /// One tab. `blocks` are its terminals, for the names of notifications.
+    Window { sid: String, wid: String, name: String, blocks: Vec<String> },
+    /// A block outside every tab, such as a port forward. Not tappable.
+    Note,
+    NewSession,
+}
+
+/// One line of the session list.
+struct Row {
+    kind: RowKind,
+    text: String,
+    status: String,
+    /// Where it was drawn, for taps.
+    span: Option<Rect>,
+}
+
+struct ListView {
+    rows: Vec<Row>,
+    stale: Option<Instant>,
+    drawn: bool,
+    /// How many rows are scrolled off the top.
+    top: usize,
+    press: Option<(i32, i32, i32)>,
+}
+
+/// The most urgent state among a terminal's program status records.
+fn status_of(records: &Value) -> String {
+    let states: Vec<&str> = records
+        .as_array()
+        .map(|a| a.iter().filter_map(|r| r["state"].as_str()).collect())
+        .unwrap_or_default();
+    ["blocked", "error", "working", "done"]
+        .into_iter()
+        .find(|s| states.contains(s))
+        .map(|s| format!("[{s}]"))
+        .unwrap_or_default()
+}
+
+/// A window's label, unless it is the default the server made from its ID.
+fn real_label(w: &Value) -> Option<&str> {
+    w["label"].as_str().filter(|l| !l.is_empty() && !l.starts_with("Window "))
+}
+
+/// Ask the server for every session and its tabs. Also returns a name for
+/// each terminal, "session / title", for notifications.
+fn load_rows(ctl: &mut Control, net: &mut Net) -> Result<(Vec<Row>, HashMap<String, String>), String> {
+    let mut rows = Vec::new();
+    let mut names = HashMap::new();
+    let sessions = ctl.call(net, "session.list", json!({}))?;
+    for s in sessions["sessions"].as_array().into_iter().flatten() {
+        let Some(sid) = s["session_id"].as_str() else {
+            continue;
+        };
+        let Ok(view) = ctl.call(net, "session.view", json!({"session_id": sid})) else {
+            continue; // destroyed since the list was made
+        };
+        let label = view["label"].as_str().unwrap_or("session").to_string();
+        rows.push(Row {
+            kind: RowKind::Session { sid: sid.to_string(), label: label.clone() },
+            text: label.clone(),
+            status: String::new(),
+            span: None,
+        });
+        for (i, w) in view["windows"].as_array().into_iter().flatten().enumerate() {
+            let Some(wid) = w["window_id"].as_str() else {
+                continue;
+            };
+            let focused = w["focused_block_id"].as_str();
+            let (mut blocks, mut first, mut main, mut status, mut others) =
+                (Vec::new(), None, None, String::new(), 0);
+            for b in w["layers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|l| l["blocks"].as_array().into_iter().flatten())
+            {
+                let Some(bid) = b["block_id"].as_str() else {
+                    continue;
+                };
+                if b["creator_name"] != TERMINAL {
+                    others += 1;
+                    continue;
+                }
+                let title = ctl
+                    .terminal(net, "title", sid, bid, json!({}))
+                    .ok()
+                    .and_then(|t| t["title"].as_str().map(str::to_string))
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| b["label"].as_str().unwrap_or("terminal").to_string());
+                let st = ctl
+                    .terminal(net, "program_status", sid, bid, json!({}))
+                    .map(|r| status_of(&r["records"]))
+                    .unwrap_or_default();
+                if status.is_empty() || st == "[blocked]" {
+                    status = st;
+                }
+                names.insert(bid.to_string(), format!("{label} / {title}"));
+                if Some(bid) == focused {
+                    main = Some(title.clone());
+                }
+                first.get_or_insert(title);
+                blocks.push(bid.to_string());
+            }
+            let title = real_label(w)
+                .map(str::to_string)
+                .or(main)
+                .or(first)
+                .unwrap_or_else(|| "no terminal".to_string());
+            let extra = blocks.len().saturating_sub(1) + others;
+            let more = if extra > 0 { format!("  (+{extra})") } else { String::new() };
+            rows.push(Row {
+                kind: RowKind::Window {
+                    sid: sid.to_string(),
+                    wid: wid.to_string(),
+                    name: format!("{label} / {title}"),
+                    blocks,
+                },
+                text: format!("{:>2}  {title}{more}", i + 1),
+                status,
+                span: None,
+            });
+        }
+        // Blocks that sit in no tab: port forwards and detached terminals.
+        let listed = ctl.call(net, "session.list_blocks", json!({"session_id": sid}));
+        for b in listed.iter().flat_map(|l| l["blocks"].as_array().into_iter().flatten()) {
+            if b["placement"] == "placed" {
+                continue;
+            }
+            let what = if b["creator_name"] == "com.superlogical.tunnel" { "[port forward]" } else { "[detached]" };
+            rows.push(Row {
+                kind: RowKind::Note,
+                text: format!("    {}", b["label"].as_str().unwrap_or("block")),
+                status: what.to_string(),
+                span: None,
+            });
+        }
+    }
+    rows.push(Row {
+        kind: RowKind::NewSession,
+        text: "+ New session".to_string(),
+        status: String::new(),
+        span: None,
+    });
+    Ok((rows, names))
+}
+
+// ---------------------------------------------------------------- panes
+
+/// One terminal: a local emulator fed by the block's data stream.
+struct TermView {
+    term: Term<Listener>,
+    parser: Processor<StdSyncHandler>,
+    area: TermArea,
+    /// What each drawn cell looked like last (see render::cell_look).
+    shadow: Vec<u64>,
+    data: Wire,
+    filter: Option<StreamFilter>,
+    /// Whether this client owns the block, and so decides its size.
+    owner: bool,
+    exited: bool,
+    stream_closed: Option<String>,
+    /// Typed bytes not yet sent. One write is in flight at a time, because
+    /// the server may run two writes out of order.
+    pending: Vec<u8>,
+    inflight: Option<String>,
+    /// When to read the screen again. The first read races with the
+    /// stream, so output from that moment can be missing or doubled; a
+    /// second read once the terminal is quiet settles it.
+    settle: Option<(Instant, Instant)>,
+}
+
+enum Body {
+    Term(Box<TermView>),
+    /// A block that isn't a terminal: a few lines about it.
+    Info(Vec<String>),
+}
+
+struct Pane {
+    block_id: String,
+    /// Where the pane sits in its tab, as fractions: x, y, w, h.
+    frac: [f64; 4],
+    /// Where it is drawn. `None` while another pane is zoomed.
+    rect: Option<Rect>,
+    title: String,
+    title_drawn: String,
+    body: Body,
+    reopen: Option<(Instant, u32)>,
+}
+
+/// One open tab.
+struct WinView {
+    session_id: String,
+    window_id: String,
+    name: String,
+    revision: u64,
+    panes: Vec<Pane>,
+    focus: usize,
+    zoom: bool,
+    /// Dragging selects text instead of scrolling.
+    select: bool,
+    drag: Option<(i32, i32)>,
+    repaint: bool,
+    /// The layout changed on the server: read it again.
+    stale: bool,
+    /// The pane to focus once it appears, after a split.
+    want_focus: Option<String>,
+    chrome: String,
+    floating: usize,
+}
+
+enum View {
+    List(ListView),
+    Win(Box<WinView>),
+    /// A message that fills the screen. A tap tries to connect again.
+    Notice { lines: Vec<String>, drawn: bool },
+}
+
+// ---------------------------------------------------------------- overlays
+
+/// Something a menu item, a key or a dialog's answer makes happen.
+#[derive(Clone)]
+enum Act {
+    NewSession,
+    NewTab(String),
+    Split(&'static str),
+    Zoom,
+    ClosePane,
+    RenameTab,
+    RenameSession(String, String),
+    EndSession(String, String),
+    Select,
+    Paste,
+    Font(i32),
+    Refresh,
+    Keyboard,
+    /// Answer a prompt that an action on the server raised.
+    Reply(String),
+}
+
+struct PickItem {
+    id: String,
+    text: String,
+    on: bool,
+}
+
+enum AskKind {
+    Text { value: String, hint: String },
+    Confirm { detail: String, yes: String },
+    Pick { items: Vec<PickItem>, multiple: bool },
+}
+
+struct Ask {
+    title: String,
+    kind: AskKind,
+    act: Act,
+    /// Tap targets, set when drawn: cancel, confirm, and the pick items.
+    cancel: Rect,
+    ok: Rect,
+    items: Vec<Rect>,
+}
+
+enum Answer {
+    Text(String),
+    Yes,
+    Ids(Vec<String>),
+}
+
+enum Overlay {
+    Menu { items: Vec<(String, Act)>, spans: Vec<Rect>, area: Rect },
+    Ask(Ask),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyBtn {
+    Key(KeyAction),
+    Ctrl,
+    CtrlC,
+    Menu,
+}
+
+const KEY_ROW: [(&str, KeyBtn); 10] = [
+    ("Esc", KeyBtn::Key(KeyAction::Esc)),
+    ("Tab", KeyBtn::Key(KeyAction::Tab)),
+    ("Ctrl", KeyBtn::Ctrl),
+    ("^C", KeyBtn::CtrlC),
+    ("\u{2190}", KeyBtn::Key(KeyAction::Left)),
+    ("\u{2193}", KeyBtn::Key(KeyAction::Down)),
+    ("\u{2191}", KeyBtn::Key(KeyAction::Up)),
+    ("\u{2192}", KeyBtn::Key(KeyAction::Right)),
+    ("Enter", KeyBtn::Key(KeyAction::Enter)),
+    ("Menu", KeyBtn::Menu),
+];
+
+struct Retry {
+    at: Instant,
+    tries: u32,
+    /// The tab to open again: session, window, focused pane, zoomed.
+    resume: Option<(String, String, Option<String>, bool)>,
+}
+
+struct App {
+    screen: Screen,
+    canvas: Vec<u8>,
+    rot: Rot,
+    fonts: Vec<Psf2Font>,
+    font_ix: usize,
+    ui: Psf2Font,
+    big: Psf2Font,
+    palette: palette::Palette,
+    net: Net,
+    ctl: Option<Control>,
+    /// "other", or "app" to receive prompts.
+    kind: String,
+    view: View,
+    overlay: Option<Overlay>,
+    overlay_drawn: bool,
+    /// Draw into the canvas only: one refresh follows for all of it. The
+    /// screen drops a full refresh that a partial one follows at once.
+    hold: bool,
+    /// When to refresh the whole screen once more. AppLoad drops a full
+    /// refresh when a partial one arrives while it is still pending, so
+    /// after each full refresh the partial ones wait and one more full
+    /// refresh shows what they would have.
+    settle_at: Option<Instant>,
+    dirty: DirtyRegion,
+    /// Leave room at the bottom for AppLoad's on-screen keyboard.
+    kbd: bool,
+    /// Ctrl and Alt pressed on their own, on the key row or on AppLoad's
+    /// keyboard: each applies to the next key.
+    ctrl: bool,
+    alt: bool,
+    clip: String,
+    banner: Option<(String, Instant)>,
+    names: HashMap<String, String>,
+    retry: Option<Retry>,
+    last_load: Instant,
+}
+
+/// Where the parts of the screen are.
+struct Geo {
+    lw: usize,
+    lh: usize,
+    /// Top of the key row: the terminals fill everything above it.
+    keys_y: usize,
+    bar_y: usize,
+}
+
+/// Collect the blocks of a layout tree with their places.
+fn flatten(node: &Value, out: &mut Vec<(String, [f64; 4])>) {
+    if let Some(id) = node["block_id"].as_str() {
+        let mut r = [0.0, 0.0, 1.0, 1.0];
+        for (i, v) in node["rect"].as_array().into_iter().flatten().take(4).enumerate() {
+            r[i] = v.as_f64().unwrap_or(r[i]);
+        }
+        out.push((id.to_string(), r));
+    } else if node["split"].is_object() {
+        flatten(&node["split"]["before"], out);
+        flatten(&node["split"]["after"], out);
+    }
+}
+
+struct WinInfo {
+    /// Block, place, creator, label.
+    panes: Vec<(String, [f64; 4], String, String)>,
+    focused: Option<String>,
+    zoomed: Option<String>,
+    /// The tab's label, if someone gave it one.
+    label: Option<String>,
+    floating: usize,
+}
+
+/// What a session view says about one window. Only the tiled layer is
+/// shown; floating layers are counted.
+fn window_info(view: &Value, wid: &str) -> Option<WinInfo> {
+    let w = view["windows"]
+        .as_array()?
+        .iter()
+        .find(|w| w["window_id"].as_str() == Some(wid))?;
+    let mut info = WinInfo {
+        panes: Vec::new(),
+        focused: w["focused_block_id"].as_str().map(str::to_string),
+        zoomed: w["zoomed_block_id"].as_str().map(str::to_string),
+        label: real_label(w).map(str::to_string),
+        floating: 0,
+    };
+    for layer in w["layers"].as_array().into_iter().flatten() {
+        if layer["kind"] != "tiled" {
+            if layer["state"] != "minimized" {
+                info.floating += 1;
+            }
+            continue;
+        }
+        let mut places = Vec::new();
+        flatten(&layer["layout"], &mut places);
+        for (id, frac) in places {
+            let b = layer["blocks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|b| b["block_id"].as_str() == Some(id.as_str()));
+            let creator = b.and_then(|b| b["creator_name"].as_str()).unwrap_or("").to_string();
+            let label = b.and_then(|b| b["label"].as_str()).unwrap_or("").to_string();
+            info.panes.push((id, frac, creator, label));
+        }
+    }
+    Some(info)
+}
+
+/// A pane's place on a `w` x `h` canvas.
+fn frac_rect(f: [f64; 4], w: usize, h: usize) -> Rect {
+    let x0 = (f[0] * w as f64).round() as usize;
+    let y0 = (f[1] * h as f64).round() as usize;
+    let x1 = (((f[0] + f[2]) * w as f64).round() as usize).min(w);
+    let y1 = (((f[1] + f[3]) * h as f64).round() as usize).min(h);
+    Rect::new(x0.min(w), y0.min(h), x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1))
+}
+
+/// The part of a pane that holds its content: all of it when it is the
+/// only one shown, otherwise what the title strip and the dividing lines
+/// leave.
+fn inner(r: Rect, multi: bool) -> Rect {
+    if multi {
+        Rect::new(r.x + 2, r.y + TITLE_H, r.w.saturating_sub(6), r.h.saturating_sub(TITLE_H + 4))
+    } else {
+        r
+    }
+}
+
+/// Columns and rows that fit in `r`.
+fn fit(font: &Psf2Font, r: Rect) -> (usize, usize) {
+    ((r.w / font.width).max(1), (r.h / font.height).max(1))
+}
+
+/// Where a `cols` x `rows` terminal is drawn inside `r`. One larger than
+/// `r` shows its left columns and its last rows.
+fn make_area(font: &Psf2Font, r: Rect, cols: usize, rows: usize) -> TermArea {
+    let (fc, fr) = fit(font, r);
+    let shown = rows.min(fr);
+    TermArea {
+        cols: cols.min(fc),
+        rows: shown,
+        cw: font.width,
+        ch: font.height,
+        x0: r.x + r.w.saturating_sub(fc * font.width) / 2,
+        y0: r.y,
+        row_off: rows - shown,
+    }
+}
+
+fn new_term(cols: usize, rows: usize, content: &str) -> (Term<Listener>, Processor<StdSyncHandler>) {
+    let mut term = Term::new(
+        Config {
+            scrolling_history: 5000,
+            ..Config::default()
+        },
+        &GridSize { cols, lines: rows },
+        Listener,
+    );
+    let mut parser: Processor<StdSyncHandler> = Processor::new();
+    parser.advance(&mut term, content.as_bytes());
+    (term, parser)
+}
+
+/// The terminal's screen and scrollback as escape sequences that redraw it.
+fn fetch_content(ctl: &mut Control, net: &mut Net, sid: &str, bid: &str) -> Result<String, String> {
+    let extras = json!({"format": "vt", "extra_cursor": true, "extra_modes": true,
+                        "extra_style": true, "extra_scrolling_region": true,
+                        "max_bytes": 900_000});
+    let first = ctl.terminal(net, "format", sid, bid, extras)?;
+    let content = first["content"].as_str().unwrap_or("").to_string();
+    let (Some(id), Some(total)) = (first["id"].as_u64(), first["total"].as_u64()) else {
+        return Ok(content);
+    };
+    // More scrollback than one reply holds, and `content` is its oldest
+    // part. Read the newest part instead, from a line start.
+    let offset = total.saturating_sub(600_000);
+    let tail = ctl.terminal(
+        net,
+        "blob_read",
+        sid,
+        bid,
+        json!({"id": id, "offset": offset, "max_bytes": 900_000}),
+    )?;
+    let text = tail["data"].as_str().unwrap_or("");
+    let start = text.find("\r\n").map_or(0, |i| i + 2);
+    Ok(format!("\x1b[0m{}", &text[start..]))
+}
+
+impl TermView {
+    /// Take one message from the data stream. `mute` drops the program's
+    /// output, for bytes the screen we just read already includes. Returns
+    /// Rex's own messages, such as a new size.
+    fn on_data(&mut self, msg: In, mute: bool) -> Vec<Value> {
+        let mut out = Vec::new();
+        match msg {
+            In::Binary(b) => match &mut self.filter {
+                None => {
+                    // The handshake answer: WELCOME carries the channel nonce.
+                    if b.len() >= 32 && b[0] == 0x81 {
+                        let nonce = u64::from_le_bytes(b[24..32].try_into().unwrap());
+                        self.filter = Some(StreamFilter::new(nonce));
+                    } else {
+                        let code = b.get(1).copied().unwrap_or(0);
+                        self.stream_closed = Some(format!("refused, reason {code}"));
+                    }
+                }
+                Some(filter) => {
+                    for item in filter.feed(&b) {
+                        match item {
+                            Item::Bytes(bytes) if !mute => {
+                                self.parser.advance(&mut self.term, &bytes);
+                                if let Some((at, limit)) = &mut self.settle {
+                                    *at = (Instant::now() + Duration::from_millis(700)).min(*limit);
+                                }
+                            }
+                            Item::Bytes(_) => {}
+                            Item::Msg(m) => out.push(m),
+                        }
+                    }
+                }
+            },
+            In::Closed(reason) => self.stream_closed = Some(reason),
+            In::Text(_) => {}
+        }
+        out
+    }
+
+    fn size(&self) -> (usize, usize) {
+        (self.term.columns(), self.term.screen_lines())
+    }
+
+    /// The grid point under a canvas position, for selecting text.
+    fn point_at(&self, x: i32, y: i32) -> Point {
+        let a = &self.area;
+        let col = ((x - a.x0 as i32).max(0) as usize / a.cw).min(a.cols.saturating_sub(1));
+        let row = ((y - a.y0 as i32).max(0) as usize / a.ch).min(a.rows.saturating_sub(1));
+        let line = (row + a.row_off) as i32 - self.term.grid().display_offset() as i32;
+        Point::new(Line(line), Column(col))
+    }
+}
+
+/// Claim nothing, but follow one terminal: size it, start its stream and
+/// read its screen. The caller has attached to the session and owns the
+/// block.
+fn open_term(
+    ctl: &mut Control,
+    net: &mut Net,
+    font: &Psf2Font,
+    sid: &str,
+    bid: &str,
+    r: Rect,
+) -> Result<TermView, String> {
+    let (cols, rows) = fit(font, r);
+    ctl.terminal(
+        net,
+        "resize",
+        sid,
+        bid,
+        json!({"columns": cols, "rows": rows,
+               "cell_width_px": font.width, "cell_height_px": font.height}),
+    )?;
+    let ticket = ctl.call(
+        net,
+        "data.connect",
+        json!({"session_id": sid, "block_id": bid,
+               "data_ref_id": "terminal", "subprotocol": "rex.data.terminal.v1"}),
+    )?;
+    let ticket = ticket["ticket"]
+        .as_str()
+        .and_then(wire::b64url_decode)
+        .filter(|t| t.len() == 16)
+        .ok_or("the server sent no data ticket")?;
+    let data = net.open("/api/data", "rex.data.terminal.v1");
+    let mut hello = vec![0x01];
+    hello.extend_from_slice(&ticket);
+    data.send(Out::Binary(hello));
+
+    let (term, parser) = new_term(cols, rows, "");
+    let now = Instant::now();
+    let mut tv = TermView {
+        term,
+        parser,
+        area: make_area(font, r, cols, rows),
+        shadow: Vec::new(),
+        data,
+        filter: None,
+        owner: true,
+        exited: false,
+        stream_closed: None,
+        pending: Vec::new(),
+        inflight: None,
+        settle: Some((now + Duration::from_millis(700), now + Duration::from_secs(5))),
+    };
+    // Wait for the stream to start before reading the screen: the stream
+    // then covers everything after the read, and what it carried before
+    // the read is dropped as already included.
+    match net.wait_wire(tv.data.id, Duration::from_secs(20)) {
+        Some(first) => {
+            tv.on_data(first, true);
+        }
+        None => return Err("the terminal's stream did not start".into()),
+    }
+    if let Some(why) = &tv.stream_closed {
+        return Err(format!("the terminal's stream was {why}"));
+    }
+    let content = fetch_content(ctl, net, sid, bid)?;
+    tv.parser.advance(&mut tv.term, content.as_bytes());
+    for m in net.take_wire(tv.data.id) {
+        for msg in tv.on_data(m, true) {
+            // A size from before our resize took effect.
+            let (c, r2) = (msg["cols"].as_u64().unwrap_or(0), msg["rows"].as_u64().unwrap_or(0));
+            if msg["type"] == "child_exited" {
+                tv.exited = true;
+            } else if msg["type"] == "resize" && c > 0 && r2 > 0 && (c as usize, r2 as usize) != tv.size() {
+                tv.term.resize(GridSize { cols: c as usize, lines: r2 as usize });
+                tv.area = make_area(font, r, c as usize, r2 as usize);
+            }
+        }
+    }
+    Ok(tv)
+}
+
+/// What to show for a block that isn't a terminal.
+fn info_lines(ctl: &mut Control, net: &mut Net, sid: &str, bid: &str, creator: &str, label: &str) -> Vec<String> {
+    let call = |ctl: &mut Control, net: &mut Net, m: &str| {
+        ctl.call(net, &format!("{creator}.{m}"), json!({"session_id": sid, "block_id": bid, "args": {}}))
+    };
+    let mut lines = Vec::new();
+    match creator {
+        "com.superlogical.tunnel" => {
+            lines.push("Port forward".to_string());
+            if let Ok(i) = call(ctl, net, "info") {
+                let s = |k: &str| i[k].as_str().unwrap_or("").to_string();
+                if i["flavor"] == "dial" {
+                    lines.push(format!("connects to {}", s("target")));
+                    if !s("client_address").is_empty() {
+                        lines.push(format!("from {}", s("client_address")));
+                    }
+                } else {
+                    lines.push(format!("listens on {}", s("address")));
+                    if !s("client_target").is_empty() {
+                        lines.push(format!("for {}", s("client_target")));
+                    }
+                }
+                lines.push(format!("{} connections now", i["connections"].as_u64().unwrap_or(0)));
+            }
+        }
+        "com.superlogical.onboarding" => {
+            lines.push("Rex walkthrough".to_string());
+            if let Ok(i) = call(ctl, net, "state") {
+                let step = i["step"].as_str().filter(|s| !s.is_empty()).unwrap_or("first step");
+                lines.push(format!("at: {step}"));
+            }
+            lines.push("Open it in Rex on the Mac.".to_string());
+        }
+        _ => {
+            lines.push(if label.is_empty() { "Block".to_string() } else { label.to_string() });
+            lines.push(format!("made by {creator}"));
+            lines.push("This client can't show it.".to_string());
+        }
+    }
+    lines
+}
+
+impl App {
+    fn geo(&self) -> Geo {
+        let (lw, lh) = (render::canvas_w(), render::canvas_h());
+        let bottom = lh - if self.kbd { KBD_H.min(lh / 2) } else { 0 };
+        let bar_y = bottom - BAR_H;
+        Geo { lw, lh, keys_y: bar_y - KEYS_H, bar_y }
+    }
+
+    /// Copy the whole canvas to the screen and refresh all of it.
+    fn present(&mut self) {
+        if self.hold {
+            return;
+        }
+        self.show_all();
+        self.settle_at = Some(Instant::now() + Duration::from_millis(450));
+    }
+
+    fn show_all(&mut self) {
+        let (lw, lh) = (render::canvas_w(), render::canvas_h());
+        self.dirty = DirtyRegion::default();
+        orient::blit(
+            &self.canvas,
+            lw,
+            self.screen.framebuffer(),
+            SCREEN_W,
+            SCREEN_H,
+            self.rot,
+            (0, 0, lw, lh),
+        );
+        self.screen.update_all();
+    }
+
+    /// Refresh the parts of the screen that changed.
+    fn flush(&mut self) {
+        if self.settle_at.is_none() {
+            self.dirty.flush(&self.canvas, &mut self.screen, self.rot);
+        }
+    }
+
+    fn notice(&mut self, text: &str) {
+        eprintln!("rexpaper: {text}");
+        self.overlay = None;
+        self.view = View::Notice {
+            lines: wrap(text, 44),
+            drawn: false,
+        };
+    }
+
+    fn say(&mut self, text: &str) {
+        eprintln!("rexpaper: {text}");
+        self.banner = Some((text.to_string(), Instant::now()));
+        self.touch_chrome();
+    }
+
+    /// Make the bar, or the list, draw again.
+    fn touch_chrome(&mut self) {
+        match &mut self.view {
+            View::Win(wv) => wv.chrome.clear(),
+            View::List(lv) if self.overlay.is_none() => lv.drawn = false,
+            _ => {}
+        }
+    }
+
+    fn call(&mut self, method: &str, payload: Value) -> Result<Value, String> {
+        let ctl = self.ctl.as_mut().ok_or("not connected")?;
+        ctl.call(&mut self.net, method, payload)
+    }
+
+    fn send(&mut self, method: &str, payload: Value) {
+        if let Some(ctl) = self.ctl.as_mut() {
+            ctl.send(method, payload);
+        }
+    }
+
+    // ------------------------------------------------------ connection
+
+    fn connect(&mut self) {
+        self.ctl = None;
+        let kind = self.kind.clone();
+        let result = Control::connect(&mut self.net, &kind).and_then(|mut ctl| {
+            // Lets this connection use every session, and sends the events
+            // that keep the list current and carry notifications.
+            ctl.call(&mut self.net, "session.attach_all", json!({"event_scope": "all"}))?;
+            let loaded = load_rows(&mut ctl, &mut self.net)?;
+            Ok((ctl, loaded))
+        });
+        let resume = self.retry.as_ref().and_then(|r| r.resume.clone());
+        match result {
+            Ok((ctl, (rows, names))) => {
+                self.ctl = Some(ctl);
+                self.retry = None;
+                self.names = names;
+                self.last_load = Instant::now();
+                self.view = View::List(ListView { rows, stale: None, drawn: false, top: 0, press: None });
+                if let Some((sid, wid, focus, zoom)) = resume {
+                    self.open(&sid, &wid, None, focus.as_deref());
+                    if matches!(&self.view, View::Win(wv) if zoom && wv.panes.len() > 1) {
+                        self.perform(Act::Zoom, None);
+                    }
+                }
+            }
+            Err(e) => {
+                let host = self.net.target.host().to_string();
+                let tries = self.retry.as_ref().map_or(0, |r| r.tries) + 1;
+                let wait = Duration::from_secs((1u64 << tries.min(4)).min(15));
+                self.retry = Some(Retry { at: Instant::now() + wait, tries, resume });
+                self.notice(&format!(
+                    "Can't reach Rex on {host}: {e}. Trying again shortly; tap to try now."
+                ));
+            }
+        }
+    }
+
+    /// The control connection is gone. Remember the open tab and start
+    /// connecting again.
+    fn lost(&mut self, why: &str) {
+        let resume = match &self.view {
+            View::Win(wv) => Some((
+                wv.session_id.clone(),
+                wv.window_id.clone(),
+                wv.panes.get(wv.focus).map(|p| p.block_id.clone()),
+                wv.zoom,
+            )),
+            _ => self.retry.as_ref().and_then(|r| r.resume.clone()),
+        };
+        self.ctl = None;
+        self.retry = Some(Retry { at: Instant::now() + Duration::from_millis(500), tries: 0, resume });
+        self.notice(&format!("Lost the connection to Rex ({why}). Connecting again..."));
+    }
+
+    fn show_list(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return self.connect();
+        };
+        let top = match &self.view {
+            View::List(lv) => lv.top,
+            _ => 0,
+        };
+        match load_rows(ctl, &mut self.net) {
+            Ok((rows, names)) => {
+                self.names = names;
+                self.last_load = Instant::now();
+                let top = top.min(rows.len().saturating_sub(1));
+                self.view = View::List(ListView { rows, stale: None, drawn: false, top, press: None });
+            }
+            Err(e) => self.lost(&e),
+        }
+    }
+
+    // ------------------------------------------------------ tabs
+
+    /// Lay the panes of `info` out on the canvas: which are shown, and where.
+    fn place(&self, fracs: &[[f64; 4]], focus: usize, zoom: bool) -> Vec<Option<Rect>> {
+        let g = self.geo();
+        let single = zoom || fracs.len() == 1;
+        fracs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if single {
+                    (i == focus).then(|| Rect::new(0, 0, g.lw, g.keys_y))
+                } else {
+                    Some(frac_rect(*f, g.lw, g.keys_y))
+                }
+            })
+            .collect()
+    }
+
+    fn make_pane(&mut self, sid: &str, p: &(String, [f64; 4], String, String), rect: Option<Rect>, multi: bool) -> Pane {
+        let (bid, frac, creator, label) = p;
+        let font = self.fonts[self.font_ix].clone();
+        let g = self.geo();
+        // A pane hidden by zoom is sized as if it filled the screen.
+        let r = inner(rect.unwrap_or(Rect::new(0, 0, g.lw, g.keys_y)), multi && rect.is_some());
+        let (mut title, mut reopen) = (label.clone(), None);
+        let body = match (creator.as_str(), self.ctl.as_mut()) {
+            (TERMINAL, Some(ctl)) => {
+                if let Some(t) = ctl
+                    .terminal(&mut self.net, "title", sid, bid, json!({}))
+                    .ok()
+                    .and_then(|t| t["title"].as_str().map(str::to_string))
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    title = t;
+                }
+                match open_term(ctl, &mut self.net, &font, sid, bid, r) {
+                    Ok(tv) => Body::Term(Box::new(tv)),
+                    Err(e) => {
+                        eprintln!("rexpaper: {bid}: {e}");
+                        reopen = Some((Instant::now() + Duration::from_secs(2), 1));
+                        Body::Info(vec!["Couldn't open this terminal:".to_string(), e])
+                    }
+                }
+            }
+            (_, Some(ctl)) => Body::Info(info_lines(ctl, &mut self.net, sid, bid, creator, label)),
+            _ => Body::Info(vec!["Not connected.".to_string()]),
+        };
+        Pane {
+            block_id: bid.clone(),
+            frac: *frac,
+            rect,
+            title,
+            title_drawn: String::new(),
+            body,
+            reopen,
+        }
+    }
+
+    /// Attach to the tab's session, claim its terminals, size them to this
+    /// screen and start following their output.
+    fn open_window(&mut self, sid: &str, wid: &str, name: Option<&str>, focus: Option<&str>) -> Result<WinView, String> {
+        self.call("session.attach", json!({"session_id": sid}))?;
+        let view = self.call("session.view", json!({"session_id": sid}))?;
+        let info = window_info(&view, wid).ok_or("that tab is gone")?;
+        let terms: Vec<&str> = info
+            .panes
+            .iter()
+            .filter(|p| p.2 == TERMINAL)
+            .map(|p| p.0.as_str())
+            .collect();
+        if !terms.is_empty() {
+            self.call(
+                "session.own_block",
+                json!({"session_id": sid, "block_ids": terms, "mode": "take"}),
+            )?;
+        }
+        let pick = |id: &Option<String>| id.as_ref().and_then(|id| info.panes.iter().position(|p| &p.0 == id));
+        let wanted = focus.and_then(|f| info.panes.iter().position(|p| p.0 == f));
+        let zoom = info.zoomed.is_some() && wanted.is_none();
+        let focus = wanted.or(pick(&info.zoomed)).or(pick(&info.focused)).unwrap_or(0);
+        let fracs: Vec<[f64; 4]> = info.panes.iter().map(|p| p.1).collect();
+        let rects = self.place(&fracs, focus, zoom);
+        let multi = rects.iter().flatten().count() > 1;
+        let mut panes = Vec::new();
+        for (p, rect) in info.panes.iter().zip(rects) {
+            panes.push(self.make_pane(sid, p, rect, multi));
+        }
+        let name = match name {
+            Some(n) => n.to_string(),
+            None => {
+                let label = view["label"].as_str().unwrap_or("session");
+                let title = panes.get(focus).map_or("", |p| p.title.as_str());
+                format!("{label} / {}", info.label.as_deref().unwrap_or(title))
+            }
+        };
+        Ok(WinView {
+            session_id: sid.to_string(),
+            window_id: wid.to_string(),
+            name,
+            revision: view["revision"].as_u64().unwrap_or(0),
+            panes,
+            focus,
+            zoom,
+            select: false,
+            drag: None,
+            repaint: true,
+            stale: false,
+            want_focus: None,
+            chrome: String::new(),
+            floating: info.floating,
+        })
+    }
+
+    fn open(&mut self, sid: &str, wid: &str, name: Option<&str>, focus: Option<&str>) {
+        let old = match &self.view {
+            View::Win(wv) if wv.session_id != sid => Some(wv.session_id.clone()),
+            _ => None,
+        };
+        match self.open_window(sid, wid, name, focus) {
+            Ok(wv) => {
+                self.view = View::Win(Box::new(wv));
+                if let Some(old) = old {
+                    self.send("session.detach", json!({"session_id": old}));
+                }
+            }
+            Err(e) => {
+                if self.ctl.is_some() {
+                    self.send("session.detach", json!({"session_id": sid}));
+                    self.show_list();
+                    self.say(&format!("Couldn't open that tab: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Leave the tab. Detaching hands its terminals back to the next
+    /// client in line for them, usually the Mac app.
+    fn close_window(&mut self) {
+        if let View::Win(wv) = &self.view {
+            let sid = wv.session_id.clone();
+            self.send("session.detach", json!({"session_id": sid}));
+        }
+        self.overlay = None;
+        self.show_list();
+    }
+
+    /// The tab's layout changed on the server: read it again, keep the
+    /// panes that are still there and open the new ones.
+    fn refresh_window(&mut self) {
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        wv.stale = false;
+        let (sid, wid) = (wv.session_id.clone(), wv.window_id.clone());
+        let view = match self.call("session.view", json!({"session_id": sid})) {
+            Ok(v) => v,
+            Err(_) => return self.close_window(),
+        };
+        let Some(info) = window_info(&view, &wid) else {
+            return self.close_window();
+        };
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        wv.revision = view["revision"].as_u64().unwrap_or(wv.revision);
+        wv.floating = info.floating;
+        let focused_id = wv.panes.get(wv.focus).map(|p| p.block_id.clone());
+        let want = wv.want_focus.take();
+        let zoom = wv.zoom;
+        let mut old: HashMap<String, Pane> =
+            std::mem::take(&mut wv.panes).into_iter().map(|p| (p.block_id.clone(), p)).collect();
+        let new_terms: Vec<&str> = info
+            .panes
+            .iter()
+            .filter(|p| p.2 == TERMINAL && !old.contains_key(&p.0))
+            .map(|p| p.0.as_str())
+            .collect();
+        if !new_terms.is_empty() {
+            let _ = self.call(
+                "session.own_block",
+                json!({"session_id": sid, "block_ids": new_terms, "mode": "take"}),
+            );
+        }
+        let at = |id: &Option<String>| id.as_ref().and_then(|id| info.panes.iter().position(|p| &p.0 == id));
+        let focus = at(&want).or(at(&focused_id)).or(at(&info.focused)).unwrap_or(0);
+        let fracs: Vec<[f64; 4]> = info.panes.iter().map(|p| p.1).collect();
+        let zoom = zoom && fracs.len() > 1;
+        let rects = self.place(&fracs, focus, zoom);
+        let multi = rects.iter().flatten().count() > 1;
+        let mut panes = Vec::new();
+        for (p, rect) in info.panes.iter().zip(rects) {
+            match old.remove(&p.0) {
+                Some(mut pane) => {
+                    pane.frac = p.1;
+                    panes.push(pane);
+                }
+                None => panes.push(self.make_pane(&sid, p, rect, multi)),
+            }
+        }
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        wv.panes = panes;
+        wv.focus = focus;
+        wv.zoom = zoom;
+        self.relayout();
+    }
+
+    /// Place every pane again and fit the terminals this client owns to
+    /// their new places. Called when anything about the screen changes.
+    fn relayout(&mut self) {
+        let font = self.fonts[self.font_ix].clone();
+        let View::Win(wv) = &self.view else {
+            self.touch_chrome();
+            return;
+        };
+        let fracs: Vec<[f64; 4]> = wv.panes.iter().map(|p| p.frac).collect();
+        let rects = self.place(&fracs, wv.focus, wv.zoom);
+        let multi = rects.iter().flatten().count() > 1;
+        let (View::Win(wv), ctl) = (&mut self.view, self.ctl.as_mut()) else {
+            return;
+        };
+        let mut resizes = Vec::new();
+        for (pane, rect) in wv.panes.iter_mut().zip(rects) {
+            pane.rect = rect;
+            pane.title_drawn.clear();
+            let (Some(rect), Body::Term(tv)) = (rect, &mut pane.body) else {
+                continue;
+            };
+            let r = inner(rect, multi);
+            let want = fit(&font, r);
+            if tv.owner && want != tv.size() {
+                tv.term.resize(GridSize { cols: want.0, lines: want.1 });
+                resizes.push((pane.block_id.clone(), want));
+            }
+            tv.area = make_area(&font, r, tv.term.columns(), tv.term.screen_lines());
+        }
+        wv.repaint = true;
+        if let Some(ctl) = ctl {
+            for (bid, (cols, rows)) in resizes {
+                ctl.send(
+                    &format!("{TERMINAL}.resize"),
+                    json!({"session_id": wv.session_id, "block_id": bid,
+                           "args": {"columns": cols, "rows": rows,
+                                    "cell_width_px": font.width, "cell_height_px": font.height}}),
+                );
+            }
+        }
+    }
+
+    /// Claim the tab's terminals again and size them to this screen.
+    fn take_over(&mut self) {
+        let (View::Win(wv), Some(ctl)) = (&mut self.view, self.ctl.as_mut()) else {
+            return;
+        };
+        let ids: Vec<String> = wv
+            .panes
+            .iter_mut()
+            .filter_map(|p| match &mut p.body {
+                Body::Term(tv) if !tv.owner => {
+                    tv.owner = true;
+                    Some(p.block_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        ctl.send(
+            "session.own_block",
+            json!({"session_id": wv.session_id, "block_ids": ids, "mode": "take"}),
+        );
+        // Sizes are compared with what each terminal has now, so make the
+        // ones just claimed differ.
+        for p in wv.panes.iter_mut() {
+            if let Body::Term(tv) = &mut p.body {
+                if ids.contains(&p.block_id) {
+                    tv.term.resize(GridSize { cols: 1, lines: 1 });
+                }
+            }
+        }
+        self.relayout();
+    }
+
+    fn focused_term(&mut self) -> Option<(&mut TermView, String, String)> {
+        let View::Win(wv) = &mut self.view else {
+            return None;
+        };
+        let sid = wv.session_id.clone();
+        let pane = wv.panes.get_mut(wv.focus)?;
+        match &mut pane.body {
+            Body::Term(tv) => Some((tv, sid, pane.block_id.clone())),
+            Body::Info(_) => None,
+        }
+    }
+
+    fn flush_input(&mut self) {
+        let Some(ctl) = self.ctl.as_mut() else {
+            return;
+        };
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        for pane in wv.panes.iter_mut() {
+            let Body::Term(tv) = &mut pane.body else {
+                continue;
+            };
+            if tv.inflight.is_some() || tv.pending.is_empty() {
+                continue;
+            }
+            let data = String::from_utf8_lossy(&tv.pending).to_string();
+            tv.pending.clear();
+            tv.inflight = Some(ctl.send(
+                &format!("{TERMINAL}.write"),
+                json!({"session_id": wv.session_id, "block_id": pane.block_id, "args": {"data": data}}),
+            ));
+        }
+    }
+
+    fn type_bytes(&mut self, bytes: Vec<u8>) {
+        if let Some((tv, _, _)) = self.focused_term() {
+            tv.pending.extend(bytes);
+            tv.term.selection = None;
+            if tv.term.grid().display_offset() != 0 {
+                tv.term.scroll_display(Scroll::Bottom);
+            }
+        }
+        self.flush_input();
+    }
+
+    fn key(&mut self, action: KeyAction, ctrl: bool, alt: bool) {
+        let ctrl = ctrl || std::mem::take(&mut self.ctrl);
+        let alt = alt || std::mem::take(&mut self.alt);
+        if let Some(Overlay::Ask(ask)) = &mut self.overlay {
+            match (&mut ask.kind, action) {
+                (_, KeyAction::Esc) => return self.close_overlay(),
+                (AskKind::Text { value, .. }, KeyAction::Char(c)) if !ctrl => value.push(c),
+                (AskKind::Text { value, .. }, KeyAction::Backspace) => {
+                    value.pop();
+                }
+                (_, KeyAction::Enter) => return self.answer(),
+                _ => return,
+            }
+            self.overlay_drawn = false;
+            return;
+        }
+        if self.overlay.is_some() {
+            if action == KeyAction::Esc {
+                self.close_overlay();
+            }
+            return;
+        }
+        match &self.view {
+            View::Win(_) => {
+                let mode = match self.focused_term() {
+                    Some((tv, _, _)) => *tv.term.mode(),
+                    None => return,
+                };
+                self.type_bytes(keys::encode(action, ctrl, alt, mode));
+                self.touch_chrome();
+            }
+            View::Notice { .. } if action == KeyAction::Enter => self.connect(),
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------ actions
+
+    fn close_overlay(&mut self) {
+        if let Some(Overlay::Ask(Ask { act: Act::Reply(call_id), .. })) = self.overlay.take() {
+            self.send("client.reply", json!({"call_id": call_id, "result": {"cancelled": true}}));
+        }
+        self.overlay = None;
+        match &mut self.view {
+            View::Win(wv) => wv.repaint = true,
+            View::List(lv) => lv.drawn = false,
+            View::Notice { drawn, .. } => *drawn = false,
+        }
+    }
+
+    fn ask(&mut self, title: &str, kind: AskKind, act: Act) {
+        self.overlay = Some(Overlay::Ask(Ask {
+            title: title.to_string(),
+            kind,
+            act,
+            cancel: Rect::default(),
+            ok: Rect::default(),
+            items: Vec::new(),
+        }));
+        self.overlay_drawn = false;
+    }
+
+    fn menu(&mut self, items: Vec<(String, Act)>) {
+        self.overlay = Some(Overlay::Menu { items, spans: Vec::new(), area: Rect::default() });
+        self.overlay_drawn = false;
+    }
+
+    fn window_menu(&mut self) {
+        let View::Win(wv) = &self.view else {
+            return;
+        };
+        let it = |s: &str, a: Act| (s.to_string(), a);
+        let mut items = vec![
+            it("New tab", Act::NewTab(wv.session_id.clone())),
+            it("Split right", Act::Split("horizontal")),
+            it("Split down", Act::Split("vertical")),
+        ];
+        if wv.panes.len() > 1 {
+            items.push(it(if wv.zoom { "Show all panes" } else { "Zoom this pane" }, Act::Zoom));
+        }
+        items.extend([
+            it("Close this pane", Act::ClosePane),
+            it("Rename tab", Act::RenameTab),
+            it("Select text", Act::Select),
+            it("Paste", Act::Paste),
+            it("Smaller text", Act::Font(-1)),
+            it("Larger text", Act::Font(1)),
+            it("Refresh screen", Act::Refresh),
+            it(
+                if self.kbd { "Use the whole screen" } else { "Make room for keyboard" },
+                Act::Keyboard,
+            ),
+        ]);
+        self.menu(items);
+    }
+
+    /// The dialog's answer, from its confirm button or the Enter key.
+    fn answer(&mut self) {
+        let Some(Overlay::Ask(ask)) = self.overlay.take() else {
+            return;
+        };
+        let answer = match ask.kind {
+            AskKind::Text { value, .. } => Answer::Text(value),
+            AskKind::Confirm { .. } => Answer::Yes,
+            AskKind::Pick { items, .. } => {
+                Answer::Ids(items.into_iter().filter(|i| i.on).map(|i| i.id).collect())
+            }
+        };
+        self.close_overlay();
+        self.perform(ask.act, Some(answer));
+    }
+
+    /// Do `act`. One that needs a name or a yes first opens a dialog and
+    /// comes back here with the answer.
+    fn perform(&mut self, act: Act, answer: Option<Answer>) {
+        let shell = json!({"block": {"flavor": SHELL}});
+        let (win_sid, win_wid, focus_bid) = match &self.view {
+            View::Win(wv) => (
+                wv.session_id.clone(),
+                wv.window_id.clone(),
+                wv.panes.get(wv.focus).map(|p| p.block_id.clone()),
+            ),
+            _ => Default::default(),
+        };
+        let result: Result<(), String> = (|| {
+            match (act, answer) {
+                (Act::NewSession, _) => {
+                    let made = self.call("session.create", json!({"initial_windows": [{"layout": shell}]}))?;
+                    let sid = made["session_id"].as_str().ok_or("no session came back")?.to_string();
+                    let wid = made["initial_windows"][0]["window_id"].as_str().unwrap_or("").to_string();
+                    self.open(&sid, &wid, None, None);
+                }
+                (Act::NewTab(sid), _) => {
+                    // `focus: false` leaves the Mac app on the tab it shows.
+                    let made = self.call(
+                        "session.new_window",
+                        json!({"session_id": sid, "layout": shell, "focus": false}),
+                    )?;
+                    let wid = made["window_id"].as_str().ok_or("no tab came back")?.to_string();
+                    self.open(&sid, &wid, None, None);
+                }
+                (Act::Split(direction), _) => {
+                    let anchor = focus_bid.ok_or("no pane to split")?;
+                    let made = self.call(
+                        "session.new_split",
+                        json!({"session_id": win_sid, "anchor_id": anchor, "direction": direction,
+                               "side": "after", "layout": shell, "focus": false}),
+                    )?;
+                    if let View::Win(wv) = &mut self.view {
+                        wv.want_focus = made["block_ids"][0].as_str().map(str::to_string);
+                        wv.zoom = false;
+                        wv.stale = true;
+                    }
+                }
+                (Act::Zoom, _) => {
+                    if let View::Win(wv) = &mut self.view {
+                        wv.zoom = !wv.zoom;
+                    }
+                    self.relayout();
+                }
+                (Act::ClosePane, None) => self.ask(
+                    "Close this pane?",
+                    AskKind::Confirm {
+                        detail: "The program running in it ends.".to_string(),
+                        yes: "Close".to_string(),
+                    },
+                    Act::ClosePane,
+                ),
+                (Act::ClosePane, Some(_)) => {
+                    let bid = focus_bid.ok_or("no pane to close")?;
+                    self.call("block.close", json!({"session_id": win_sid, "block_id": bid}))?;
+                }
+                (Act::RenameTab, None) => self.ask(
+                    "Name this tab",
+                    AskKind::Text { value: String::new(), hint: "empty for the default".to_string() },
+                    Act::RenameTab,
+                ),
+                (Act::RenameTab, Some(Answer::Text(label))) => {
+                    self.call(
+                        "session.set_window_label",
+                        json!({"session_id": win_sid, "window_id": win_wid, "label": label}),
+                    )?;
+                    if let (View::Win(wv), false) = (&mut self.view, label.trim().is_empty()) {
+                        let session = wv.name.split(" / ").next().unwrap_or("").to_string();
+                        wv.name = format!("{session} / {}", label.trim());
+                    }
+                }
+                (Act::RenameSession(sid, old), None) => self.ask(
+                    "Name this session",
+                    AskKind::Text { value: old.clone(), hint: "empty for the default".to_string() },
+                    Act::RenameSession(sid, old),
+                ),
+                (Act::RenameSession(sid, _), Some(Answer::Text(label))) => {
+                    self.call("session.set_label", json!({"session_id": sid, "label": label}))?;
+                }
+                (Act::EndSession(sid, label), None) => self.ask(
+                    &format!("End session {label}?"),
+                    AskKind::Confirm {
+                        detail: "Every terminal in it closes, on every device.".to_string(),
+                        yes: "End session".to_string(),
+                    },
+                    Act::EndSession(sid, label),
+                ),
+                (Act::EndSession(sid, _), Some(_)) => {
+                    self.call("session.destroy", json!({"session_id": sid}))?;
+                }
+                (Act::Select, _) => {
+                    if let View::Win(wv) = &mut self.view {
+                        wv.select = true;
+                    }
+                    self.say("Drag over the text to copy it");
+                }
+                (Act::Paste, _) => {
+                    if self.clip.is_empty() {
+                        return Err("nothing copied yet".into());
+                    }
+                    let text = self.clip.replace("\r\n", "\r").replace('\n', "\r");
+                    let bracketed = self
+                        .focused_term()
+                        .is_some_and(|(tv, _, _)| tv.term.mode().contains(TermMode::BRACKETED_PASTE));
+                    let bytes = if bracketed {
+                        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+                    } else {
+                        text.into_bytes()
+                    };
+                    self.type_bytes(bytes);
+                }
+                (Act::Font(step), _) => {
+                    let ix = (self.font_ix as i32 + step).clamp(0, FONTS.len() as i32 - 1) as usize;
+                    if ix != self.font_ix {
+                        self.font_ix = ix;
+                        let _ = std::fs::write(format!("{CONFIG_DIR}/font"), FONTS[ix].0);
+                        // Cell sizes changed: nothing drawn so far is right.
+                        if let View::Win(wv) = &mut self.view {
+                            for p in wv.panes.iter_mut() {
+                                if let Body::Term(tv) = &mut p.body {
+                                    if tv.owner {
+                                        tv.term.resize(GridSize { cols: 1, lines: 1 });
+                                    }
+                                }
+                            }
+                        }
+                        self.relayout();
+                    }
+                }
+                (Act::Refresh, _) => {
+                    if let View::Win(wv) = &mut self.view {
+                        for p in wv.panes.iter_mut() {
+                            if let Body::Term(tv) = &mut p.body {
+                                let now = Instant::now();
+                                tv.settle = Some((now, now));
+                            }
+                        }
+                        wv.repaint = true;
+                    }
+                }
+                (Act::Keyboard, _) => {
+                    self.kbd = !self.kbd;
+                    self.relayout();
+                }
+                (Act::Reply(call_id), Some(answer)) => {
+                    let result = match answer {
+                        Answer::Text(text) => json!({"text": text}),
+                        Answer::Ids(ids) => json!({"ids": ids}),
+                        Answer::Yes => json!({"cancelled": true}),
+                    };
+                    self.send("client.reply", json!({"call_id": call_id, "result": result}));
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            if self.ctl.is_some() {
+                self.say(&format!("That didn't work: {e}"));
+            }
+        }
+    }
+
+    /// An action on the server asks the person something.
+    fn prompt(&mut self, p: &Value) {
+        let call_id = p["call_id"].as_str().unwrap_or("").to_string();
+        let q = &p["prompt"];
+        let title = match p["action"].as_str() {
+            Some(a) if !a.is_empty() => format!("{} ({a})", q["title"].as_str().unwrap_or("Question")),
+            _ => q["title"].as_str().unwrap_or("Question").to_string(),
+        };
+        let kind = match q["kind"].as_str() {
+            Some("input") => AskKind::Text {
+                value: q["value"].as_str().unwrap_or("").to_string(),
+                hint: q["placeholder"].as_str().unwrap_or("").to_string(),
+            },
+            Some("pick") => AskKind::Pick {
+                items: q["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|i| PickItem {
+                        id: i["id"].as_str().unwrap_or("").to_string(),
+                        text: match i["subtitle"].as_str() {
+                            Some(s) if !s.is_empty() => format!("{}  -  {s}", i["title"].as_str().unwrap_or("")),
+                            _ => i["title"].as_str().unwrap_or("").to_string(),
+                        },
+                        on: i["selected"].as_bool().unwrap_or(false),
+                    })
+                    .collect(),
+                multiple: q["multiple"].as_bool().unwrap_or(false),
+            },
+            _ => {
+                return self.send(
+                    "client.reply",
+                    json!({"call_id": call_id,
+                           "error": {"code": "not_supported", "message": "rexpaper can't show this prompt"}}),
+                );
+            }
+        };
+        // A prompt already open is dismissed, not answered.
+        self.close_overlay();
+        self.ask(&title, kind, Act::Reply(call_id));
+    }
+
+    // ------------------------------------------------------ input
+
+    fn touch(&mut self, ev: qtfb::InputEvent) {
+        if ev.input_type == qtfb::INPUT_VKB_PRESS {
+            if !self.kbd {
+                // AppLoad's keyboard is up, and it covers the bottom rows.
+                self.kbd = true;
+                self.relayout();
+                if self.overlay.is_some() {
+                    self.overlay_drawn = false;
+                }
+            }
+            // AppLoad sends its Ctrl and Alt keys as presses of their own,
+            // not as a modifier on the key that follows.
+            match ev.x & !(keys::MOD_SHIFT | keys::MOD_CTRL | keys::MOD_ALT) {
+                0x0100_0021 => {
+                    self.ctrl = !self.ctrl;
+                    self.touch_chrome();
+                }
+                0x0100_0023 => self.alt = !self.alt,
+                0 | 0x0100_0020 | 0x0100_0022 | 0x0100_0024 => {} // Shift, Meta, Caps Lock
+                _ => match keys::decode_vkb(ev.x) {
+                    Some((action, ctrl, alt)) => self.key(action, ctrl, alt),
+                    None => eprintln!("rexpaper: unmapped virtual key {:#x}", ev.x),
+                },
+            }
+            return;
+        }
+        let g = self.geo();
+        let (x, y) = self.rot.to_logical(ev.x, ev.y, SCREEN_W, SCREEN_H);
+        // A touch at the very top is a swipe for AppLoad's title bar.
+        let press = matches!(ev.input_type, qtfb::INPUT_TOUCH_PRESS | qtfb::INPUT_PEN_PRESS) && ev.y >= 30;
+        let release = matches!(ev.input_type, qtfb::INPUT_TOUCH_RELEASE | qtfb::INPUT_PEN_RELEASE);
+        if self.overlay.is_some() {
+            if press {
+                self.overlay_touch(x, y);
+            }
+            return;
+        }
+        match &mut self.view {
+            View::Notice { .. } if press => {
+                if self.ctl.is_some() {
+                    self.show_list();
+                } else {
+                    self.connect();
+                }
+            }
+            View::List(lv) => {
+                if press {
+                    lv.press = Some((ev.dev_id, x, y));
+                } else if let (true, Some((id, x0, y0))) = (release, lv.press) {
+                    if id != ev.dev_id {
+                        return;
+                    }
+                    lv.press = None;
+                    let dy = y - y0;
+                    if dy.abs() > 80 {
+                        // A swipe scrolls by the rows it covered.
+                        let step = (dy.unsigned_abs() as usize / ITEM_H).max(1);
+                        lv.top = if dy < 0 {
+                            (lv.top + step).min(lv.rows.len().saturating_sub(1))
+                        } else {
+                            lv.top.saturating_sub(step)
+                        };
+                        lv.drawn = false;
+                    } else {
+                        self.list_tap(x0, y0);
+                    }
+                }
+            }
+            View::Win(wv) => {
+                if press && y as usize >= g.bar_y {
+                    if (x as usize) < 330 {
+                        self.close_window();
+                    } else if self.banner.is_some() {
+                        self.banner = None;
+                        self.touch_chrome();
+                    } else {
+                        self.take_over();
+                    }
+                } else if press && y as usize >= g.keys_y {
+                    let i = (x.max(0) as usize * KEY_ROW.len() / g.lw).min(KEY_ROW.len() - 1);
+                    match KEY_ROW[i].1 {
+                        KeyBtn::Key(k) => self.key(k, false, false),
+                        KeyBtn::Ctrl => {
+                            self.ctrl = !self.ctrl;
+                            self.touch_chrome();
+                        }
+                        KeyBtn::CtrlC => self.key(KeyAction::Char('c'), true, false),
+                        KeyBtn::Menu => self.window_menu(),
+                    }
+                } else if press {
+                    if let Some(i) = wv.panes.iter().position(|p| p.rect.is_some_and(|r| r.has(x, y))) {
+                        if i != wv.focus {
+                            wv.focus = i;
+                            for p in wv.panes.iter_mut() {
+                                p.title_drawn.clear();
+                            }
+                        }
+                    }
+                    wv.drag = Some((ev.dev_id, y));
+                    let select = wv.select;
+                    if let Some(Pane { body: Body::Term(tv), .. }) = wv.panes.get_mut(wv.focus) {
+                        tv.term.selection = select
+                            .then(|| Selection::new(SelectionType::Simple, tv.point_at(x, y), Side::Left));
+                    }
+                } else if wv.drag.is_some_and(|d| d.0 == ev.dev_id) {
+                    let (id, last_y) = wv.drag.unwrap();
+                    let select = wv.select;
+                    let Some(Pane { body: Body::Term(tv), .. }) = wv.panes.get_mut(wv.focus) else {
+                        return;
+                    };
+                    if select {
+                        let at = tv.point_at(x, y);
+                        if let Some(sel) = &mut tv.term.selection {
+                            sel.update(at, Side::Right);
+                        }
+                        if release {
+                            wv.drag = None;
+                            wv.select = false;
+                            let text = tv.term.selection_to_string().unwrap_or_default();
+                            let n = text.chars().count();
+                            if n > 0 {
+                                self.clip = text;
+                                self.say(&format!("Copied {n} characters. Menu > Paste puts them in a terminal."));
+                            } else {
+                                self.banner = None;
+                                self.touch_chrome();
+                            }
+                        }
+                    } else if release {
+                        wv.drag = None;
+                    } else {
+                        let lines = (y - last_y) / tv.area.ch as i32;
+                        if lines != 0 {
+                            // Drag down shows earlier history.
+                            tv.term.scroll_display(Scroll::Delta(lines));
+                            wv.drag = Some((id, last_y + lines * tv.area.ch as i32));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn list_tap(&mut self, x: i32, y: i32) {
+        let View::List(lv) = &self.view else {
+            return;
+        };
+        let Some(row) = lv.rows.iter().find(|r| r.span.is_some_and(|s| s.has(x, y))) else {
+            return;
+        };
+        match &row.kind {
+            RowKind::Window { sid, wid, name, .. } => {
+                let (sid, wid, name) = (sid.clone(), wid.clone(), name.clone());
+                self.open(&sid, &wid, Some(&name), None);
+            }
+            RowKind::Session { sid, label } => {
+                let (sid, label) = (sid.clone(), label.clone());
+                self.menu(vec![
+                    ("New tab".to_string(), Act::NewTab(sid.clone())),
+                    ("Rename session".to_string(), Act::RenameSession(sid.clone(), label.clone())),
+                    ("End session".to_string(), Act::EndSession(sid, label)),
+                ]);
+            }
+            RowKind::NewSession => self.perform(Act::NewSession, None),
+            RowKind::Note => {}
+        }
+    }
+
+    fn overlay_touch(&mut self, x: i32, y: i32) {
+        match &mut self.overlay {
+            Some(Overlay::Menu { items, spans, .. }) => {
+                let hit = spans.iter().position(|s| s.has(x, y)).map(|i| items[i].1.clone());
+                self.close_overlay();
+                if let Some(act) = hit {
+                    self.perform(act, None);
+                }
+            }
+            Some(Overlay::Ask(ask)) => {
+                if ask.ok.has(x, y) {
+                    self.answer();
+                } else if ask.cancel.has(x, y) {
+                    self.close_overlay();
+                } else if let Some(i) = ask.items.iter().position(|s| s.has(x, y)) {
+                    if let AskKind::Pick { items, multiple } = &mut ask.kind {
+                        if *multiple {
+                            items[i].on = !items[i].on;
+                            self.overlay_drawn = false;
+                        } else {
+                            for (j, it) in items.iter_mut().enumerate() {
+                                it.on = j == i;
+                            }
+                            self.answer();
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The screen turned: lay everything out for the new shape.
+    fn rotate(&mut self, rot: Rot) {
+        self.rot = rot;
+        let (lw, lh) = rot.logical_size(SCREEN_W, SCREEN_H);
+        render::set_canvas_size(lw, lh);
+        self.overlay_drawn = false;
+        match &mut self.view {
+            View::List(lv) => lv.drawn = false,
+            View::Notice { drawn, .. } => *drawn = false,
+            View::Win(_) => self.relayout(),
+        }
+    }
+
+    // ------------------------------------------------------ messages
+
+    /// One of Rex's messages from a terminal's stream.
+    fn stream_msg(&mut self, pane: usize, msg: Value) {
+        let font = self.fonts[self.font_ix].clone();
+        let me = self.ctl.as_ref().map(|c| c.client_id.clone()).unwrap_or_default();
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+        let Some(Pane { body: Body::Term(tv), rect, .. }) = wv.panes.get_mut(pane) else {
+            return;
+        };
+        match msg["type"].as_str() {
+            Some("resize") => {
+                let cols = msg["cols"].as_u64().unwrap_or(0) as usize;
+                let rows = msg["rows"].as_u64().unwrap_or(0) as usize;
+                tv.owner = msg["owner"].as_str() == Some(me.as_str());
+                wv.chrome.clear();
+                if cols > 0 && rows > 0 && (cols, rows) != tv.size() {
+                    tv.term.resize(GridSize { cols, lines: rows });
+                    if let Some(rect) = rect {
+                        tv.area = make_area(&font, inner(*rect, multi), cols, rows);
+                        wv.repaint = true;
+                    }
+                }
+            }
+            Some("child_exited") => {
+                tv.exited = true;
+                wv.chrome.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn block_event(&mut self, bid: &str, name: &str, p: &Value) {
+        let who = self.names.get(bid).cloned().unwrap_or_else(|| "A terminal".to_string());
+        match name {
+            "program_status_changed" => {
+                let r = &p["record"];
+                let state = r["state"].as_str().unwrap_or("");
+                if matches!(state, "blocked" | "done" | "error") {
+                    let what = match (state, r["kind"].as_str()) {
+                        ("blocked", Some(k)) => format!("needs you ({k})"),
+                        ("blocked", None) => "needs you".to_string(),
+                        (s, _) => s.to_string(),
+                    };
+                    let msg = r["msg"].as_str().or(r["title"].as_str()).unwrap_or("");
+                    let sep = if msg.is_empty() { "" } else { " - " };
+                    self.say(&format!("{who}: {what}{sep}{msg}"));
+                }
+                self.list_stale();
+            }
+            "program_status_removed" | "child_exited" => self.list_stale(),
+            "desktop_notification" => {
+                let (t, b) = (p["title"].as_str().unwrap_or(""), p["body"].as_str().unwrap_or(""));
+                self.say(&format!("{who}: {t} {b}"));
+            }
+            "clipboard_written" | "selection_copied" => {
+                if let Some(text) = p["text"].as_str().filter(|t| !t.is_empty()) {
+                    self.clip = text.to_string();
+                }
+            }
+            "title_changed" => {
+                if let (View::Win(wv), Some(t)) = (&mut self.view, p["title"].as_str()) {
+                    if let Some(pane) = wv.panes.iter_mut().find(|pn| pn.block_id == bid) {
+                        if !t.trim().is_empty() {
+                            pane.title = t.to_string();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn list_stale(&mut self) {
+        if let View::List(lv) = &mut self.view {
+            lv.stale.get_or_insert_with(Instant::now);
+        }
+    }
+
+    fn control_msg(&mut self, text: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        if v["type"] == "response" {
+            if let View::Win(wv) = &mut self.view {
+                for p in wv.panes.iter_mut() {
+                    if let Body::Term(tv) = &mut p.body {
+                        if tv.inflight.as_deref() == v["id"].as_str() {
+                            tv.inflight = None;
+                        }
+                    }
+                }
+                self.flush_input();
+            }
+            return;
+        }
+        if v["type"] != "event" {
+            return;
+        }
+        let event = &v["payload"];
+        let kind = event["type"].as_str().unwrap_or("");
+        if std::env::var("REXPAPER_DEBUG").is_ok() {
+            eprintln!("rexpaper: event {}", &text[..text.len().min(300)]);
+        }
+        let p = &event["payload"];
+        match kind {
+            "client_prompt_requested" => return self.prompt(p),
+            "client_prompt_ended" => {
+                let open = matches!(&self.overlay,
+                    Some(Overlay::Ask(Ask { act: Act::Reply(id), .. })) if Some(id.as_str()) == p["call_id"].as_str());
+                if open {
+                    self.overlay = None;
+                    self.close_overlay();
+                }
+                return;
+            }
+            "client_perform_requested" | "client_call_requested" => {
+                return self.send(
+                    "client.reply",
+                    json!({"call_id": p["call_id"],
+                           "error": {"code": "not_supported", "message": "rexpaper has no actions"}}),
+                );
+            }
+            "session_created" | "session_destroyed" | "session_moved" => self.list_stale(),
+            _ => {}
+        }
+        let sid = p["session_id"].as_str().unwrap_or("");
+        let inner_ev = &p["event"];
+        let name = inner_ev["type"].as_str().unwrap_or("");
+        let ip = &inner_ev["payload"];
+        if kind == "session_event" {
+            match name {
+                "block_event" => {
+                    let bid = ip["block_id"].as_str().unwrap_or("").to_string();
+                    let ev = ip["name"].as_str().unwrap_or("").to_string();
+                    self.block_event(&bid, &ev, &ip["payload"]);
+                }
+                "client_connected" | "client_disconnected" | "client_connection_changed" => {}
+                _ => self.list_stale(),
+            }
+        }
+        let me = self.ctl.as_ref().map(|c| c.client_id.clone()).unwrap_or_default();
+        let mut leave = false;
+        if let View::Win(wv) = &mut self.view {
+            if kind == "session_destroyed" && sid == wv.session_id {
+                leave = true;
+            } else if kind == "session_event" && sid == wv.session_id {
+                let bid = ip["block_id"].as_str().unwrap_or("");
+                match name {
+                    "window_closed" if ip["window_id"].as_str() == Some(wv.window_id.as_str()) => leave = true,
+                    "session_view_changed" => {
+                        if ip["revision"].as_u64().unwrap_or(0) > wv.revision {
+                            wv.stale = true;
+                        }
+                    }
+                    "block_closed" | "block_created" => wv.stale = true,
+                    "block_owner_changed" => {
+                        if let Some(Pane { body: Body::Term(tv), .. }) =
+                            wv.panes.iter_mut().find(|pn| pn.block_id == bid)
+                        {
+                            tv.owner = ip["owner"].as_str() == Some(me.as_str());
+                            wv.chrome.clear();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if leave {
+            self.overlay = None;
+            self.show_list();
+        }
+    }
+
+    fn net_msg(&mut self, id: usize, msg: In) {
+        if self.ctl.as_ref().map(Control::wire_id) == Some(id) {
+            match msg {
+                In::Text(t) => self.control_msg(&t),
+                In::Closed(reason) => self.lost(&reason),
+                In::Binary(_) => {}
+            }
+            return;
+        }
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        let Some(i) = wv
+            .panes
+            .iter()
+            .position(|p| matches!(&p.body, Body::Term(tv) if tv.data.id == id))
+        else {
+            return; // a stream we already left
+        };
+        let Body::Term(tv) = &mut wv.panes[i].body else {
+            return;
+        };
+        let msgs = tv.on_data(msg, false);
+        if let Some(why) = &tv.stream_closed {
+            eprintln!("rexpaper: stream {id} ended: {why}");
+            wv.chrome.clear();
+            if wv.panes[i].reopen.is_none() {
+                wv.panes[i].reopen = Some((Instant::now() + Duration::from_secs(2), 0));
+            }
+        }
+        for m in msgs {
+            self.stream_msg(i, m);
+        }
+    }
+
+    /// Work that waits for its moment: re-reading a terminal that has gone
+    /// quiet, reopening a stream that dropped, following a layout change.
+    fn tick(&mut self) {
+        if self.ctl.is_none() {
+            return;
+        }
+        if matches!(&self.view, View::Win(wv) if wv.stale) {
+            self.refresh_window();
+        }
+        let font = self.fonts[self.font_ix].clone();
+        let now = Instant::now();
+        let (View::Win(wv), Some(ctl)) = (&mut self.view, self.ctl.as_mut()) else {
+            return;
+        };
+        let sid = wv.session_id.clone();
+        let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+        for pane in wv.panes.iter_mut() {
+            let g_rect = pane.rect;
+            match &mut pane.body {
+                Body::Term(tv) if tv.settle.is_some_and(|(at, _)| now >= at) => {
+                    tv.settle = None;
+                    if tv.stream_closed.is_some() {
+                        continue;
+                    }
+                    let Ok(content) = fetch_content(ctl, &mut self.net, &sid, &pane.block_id) else {
+                        continue;
+                    };
+                    let (cols, rows) = tv.size();
+                    let (term, parser) = new_term(cols, rows, &content);
+                    tv.term = term;
+                    tv.parser = parser;
+                    for m in self.net.take_wire(tv.data.id) {
+                        tv.on_data(m, true);
+                    }
+                }
+                body => {
+                    let dropped = match body {
+                        // "4000 block closed": the terminal is gone for good.
+                        Body::Term(tv) => tv.stream_closed.as_ref().is_some_and(|w| !w.starts_with("4000")),
+                        Body::Info(_) => true,
+                    };
+                    let Some((at, tries)) = pane.reopen.filter(|(at, _)| dropped && now >= *at) else {
+                        continue;
+                    };
+                    let full = Rect::new(0, 0, render::canvas_w(), render::canvas_h() - BAR_H - KEYS_H);
+                    let r = inner(g_rect.unwrap_or(full), multi && g_rect.is_some());
+                    let _ = at;
+                    match open_term(ctl, &mut self.net, &font, &sid, &pane.block_id, r) {
+                        Ok(tv) => {
+                            *body = Body::Term(Box::new(tv));
+                            pane.reopen = None;
+                            wv.repaint = true;
+                        }
+                        Err(e) => {
+                            eprintln!("rexpaper: {}: {e}", pane.block_id);
+                            pane.reopen = (tries < 4).then(|| (now + Duration::from_secs(4), tries + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------ drawing
+
+    fn draw_list(&mut self) {
+        let g = self.geo();
+        let host = self.net.target.host().to_string();
+        let banner = self.banner.as_ref().map(|b| b.0.clone());
+        let View::List(lv) = &mut self.view else {
+            return;
+        };
+        lv.drawn = true;
+        let (lw, lh) = (g.lw, g.lh);
+        let fb = &mut self.canvas;
+        render::fill_rect(fb, 0, 0, lw, lh, WHITE);
+        render::draw_text(fb, &self.big, 60, 110, "Rex", BLACK, WHITE);
+        render::draw_text(fb, &self.ui, 190, 138, &clip(&host, (lw - 250) / 16), BLACK, WHITE);
+        let mut y = 230;
+        let floor = lh - 110;
+        let top = lv.top;
+        if top > 0 {
+            render::draw_text(fb, &self.ui, 90, y - 44, "... swipe down for earlier", BLACK, WHITE);
+        }
+        let mut hidden = 0;
+        for (i, row) in lv.rows.iter_mut().enumerate() {
+            row.span = None;
+            if i < top {
+                continue;
+            }
+            let h = match row.kind {
+                RowKind::Session { .. } => 120,
+                _ => 96,
+            };
+            if y + h > floor {
+                hidden += 1;
+                continue;
+            }
+            row.span = Some(Rect::new(0, y, lw, h));
+            match row.kind {
+                RowKind::Session { .. } => {
+                    render::draw_text(fb, &self.big, 60, y + 36, &clip(&row.text, (lw - 300) / 32), BLACK, WHITE);
+                    render::draw_text(fb, &self.ui, lw - 60 - 3 * 16, y + 60, "...", BLACK, WHITE);
+                    render::fill_rect(fb, 60, y + h - 4, lw - 120, 4, BLACK);
+                }
+                RowKind::Window { .. } | RowKind::Note => {
+                    let room = (lw - 180) / 16 - row.status.len();
+                    render::draw_text(fb, &self.ui, 90, y + 32, &clip(&row.text, room), BLACK, WHITE);
+                    let sx = lw - 60 - row.status.len() * 16;
+                    render::draw_text(fb, &self.ui, sx, y + 32, &row.status, BLACK, WHITE);
+                    render::fill_rect(fb, 90, y + h - 1, lw - 150, 1, BLACK);
+                }
+                RowKind::NewSession => {
+                    ui::button(fb, &self.ui, Rect::new(60, y + 20, 360, 68), &row.text, false);
+                }
+            }
+            y += h;
+        }
+        if hidden > 0 {
+            render::draw_text(fb, &self.ui, 90, floor + 4, "... swipe up for more", BLACK, WHITE);
+        }
+        if let Some(b) = banner {
+            render::fill_rect(fb, 0, lh - 60, lw, 2, BLACK);
+            render::draw_text(fb, &self.ui, 16, lh - 44, &clip(&b, lw / 16 - 2), BLACK, WHITE);
+        }
+        self.present();
+    }
+
+    fn draw_notice(&mut self) {
+        let g = self.geo();
+        let View::Notice { lines, drawn } = &mut self.view else {
+            return;
+        };
+        *drawn = true;
+        render::fill_rect(&mut self.canvas, 0, 0, g.lw, g.lh, WHITE);
+        let x = g.lw.saturating_sub(44 * 32) / 2;
+        for (i, line) in lines.iter().enumerate() {
+            render::draw_text(&mut self.canvas, &self.big, x, g.lh / 3 + i * 80, line, BLACK, WHITE);
+        }
+        self.present();
+    }
+
+    fn draw_win(&mut self) {
+        let g = self.geo();
+        let banner = self.banner.as_ref().map(|b| b.0.clone());
+        let ctrl = self.ctrl;
+        let font = &self.fonts[self.font_ix];
+        let View::Win(wv) = &mut self.view else {
+            return;
+        };
+        let full = wv.repaint;
+        let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+        if full {
+            wv.repaint = false;
+            wv.chrome.clear();
+            render::fill_rect(&mut self.canvas, 0, 0, g.lw, g.lh, WHITE);
+        }
+        let focus = wv.focus;
+        for (i, pane) in wv.panes.iter_mut().enumerate() {
+            let Some(rect) = pane.rect else {
+                continue;
+            };
+            if multi {
+                if full {
+                    // Dividing lines on the pane's right and bottom edges.
+                    render::fill_rect(&mut self.canvas, rect.x + rect.w - 3, rect.y, 3, rect.h, BLACK);
+                    render::fill_rect(&mut self.canvas, rect.x, rect.y + rect.h - 3, rect.w, 3, BLACK);
+                }
+                let key = format!("{}{}", if i == focus { '*' } else { ' ' }, pane.title);
+                if full || key != pane.title_drawn {
+                    let strip = Rect::new(rect.x, rect.y, rect.w.saturating_sub(3), TITLE_H);
+                    ui::line(&mut self.canvas, &self.ui, strip, &pane.title, i == focus);
+                    self.dirty.add_rect(strip);
+                    pane.title_drawn = key;
+                }
+            }
+            match &mut pane.body {
+                Body::Term(tv) => {
+                    if full || tv.shadow.len() != tv.area.rows * tv.area.cols {
+                        tv.shadow = vec![u64::MAX; tv.area.rows * tv.area.cols];
+                    }
+                    let sel = tv.term.selection.as_ref().and_then(|s| s.to_range(&tv.term));
+                    // Redraw only the cells whose look changed, and per row
+                    // only the span between the first and last of them:
+                    // small e-ink updates.
+                    for row in 0..tv.area.rows {
+                        let mut changed: Option<(usize, usize)> = None;
+                        for col in 0..tv.area.cols {
+                            let look = render::cell_look(
+                                &tv.term,
+                                &self.palette,
+                                row + tv.area.row_off,
+                                col,
+                                sel.as_ref(),
+                            );
+                            let slot = &mut tv.shadow[row * tv.area.cols + col];
+                            if *slot != look {
+                                *slot = look;
+                                changed = Some(changed.map_or((col, col), |(a, _)| (a, col)));
+                            }
+                        }
+                        if let Some((a, b)) = changed {
+                            render::draw_line(
+                                &mut self.canvas,
+                                font,
+                                &self.palette,
+                                &tv.term,
+                                &tv.area,
+                                row,
+                                a,
+                                b,
+                                sel.as_ref(),
+                            );
+                            let (x, y, _, _) = tv.area.cell_rect(a, row);
+                            self.dirty.add(x, y, (b - a + 1) * tv.area.cw, tv.area.ch);
+                        }
+                    }
+                }
+                Body::Info(lines) if full => {
+                    let r = inner(rect, multi);
+                    for (n, text) in lines.iter().enumerate() {
+                        let y = r.y + 40 + n * 48;
+                        if y + 32 < r.y + r.h {
+                            let t = clip(text, (r.w.saturating_sub(48) / 16).max(1));
+                            render::draw_text(&mut self.canvas, &self.ui, r.x + 24, y, &t, BLACK, WHITE);
+                        }
+                    }
+                }
+                Body::Info(_) => {}
+            }
+        }
+
+        let state = match wv.panes.get(focus).map(|p| &p.body) {
+            _ if banner.is_some() => banner.unwrap(),
+            Some(Body::Term(tv)) if tv.stream_closed.is_some() => {
+                format!("stream ended: {}", tv.stream_closed.as_deref().unwrap_or(""))
+            }
+            Some(Body::Term(tv)) if tv.exited => "program exited".to_string(),
+            _ if wv.panes.iter().any(|p| matches!(&p.body, Body::Term(tv) if !tv.owner)) => {
+                "sized by another device - tap here to fit".to_string()
+            }
+            _ if wv.select => "drag over the text to copy it".to_string(),
+            _ if wv.floating > 0 => format!("+{} floating not shown", wv.floating),
+            _ => String::new(),
+        };
+        let cols = g.lw / 16;
+        let name_room = (cols / 3).max(12);
+        let left = format!("< Sessions   {}", clip(&wv.name, name_room));
+        let state = clip(&state, cols.saturating_sub(left.chars().count() + 5));
+        let gap = cols.saturating_sub(left.chars().count() + state.chars().count() + 2);
+        let chrome = format!(" {left}{}{state}|{ctrl}", " ".repeat(gap));
+        if chrome != wv.chrome {
+            let bar = chrome.rsplit_once('|').map_or("", |c| c.0);
+            render::fill_rect(&mut self.canvas, 0, g.keys_y, g.lw, g.lh - g.keys_y, WHITE);
+            let n = KEY_ROW.len();
+            for (i, (label, btn)) in KEY_ROW.iter().enumerate() {
+                let x0 = i * g.lw / n;
+                let r = Rect::new(x0 + 4, g.keys_y + 6, (i + 1) * g.lw / n - x0 - 8, KEYS_H - 12);
+                ui::button(&mut self.canvas, &self.ui, r, label, *btn == KeyBtn::Ctrl && ctrl);
+            }
+            render::fill_rect(&mut self.canvas, 0, g.bar_y, g.lw, 2, BLACK);
+            render::draw_text(&mut self.canvas, &self.ui, 0, g.bar_y + 18, bar, BLACK, WHITE);
+            self.dirty.add(0, g.keys_y, g.lw, g.lh - g.keys_y);
+            wv.chrome = chrome;
+        }
+
+        if full {
+            self.present();
+        } else {
+            self.flush();
+        }
+    }
+
+    /// `full` when the view under the overlay was drawn again too.
+    fn draw_overlay(&mut self, full: bool) {
+        let g = self.geo();
+        self.overlay_drawn = true;
+        let fb = &mut self.canvas;
+        let area = match &mut self.overlay {
+            Some(Overlay::Menu { items, spans, area }) => {
+                let h = items.len() * ITEM_H + 8;
+                let w = MENU_W.min(g.lw - 40);
+                // Over the list it sits in the middle; over a tab, above
+                // the Menu key.
+                let (x, y) = match self.view {
+                    View::Win(_) => (g.lw - w - 12, g.keys_y.saturating_sub(h + 12)),
+                    _ => ((g.lw - w) / 2, (g.lh.saturating_sub(h)) / 3),
+                };
+                *area = Rect::new(x, y, w, h);
+                render::fill_rect(fb, x, y, w, h, WHITE);
+                ui::outline(fb, *area, 4, BLACK);
+                spans.clear();
+                for (i, (text, _)) in items.iter().enumerate() {
+                    let r = Rect::new(x + 4, y + 4 + i * ITEM_H, w - 8, ITEM_H);
+                    ui::line(fb, &self.ui, Rect::new(r.x + 16, r.y + 2, r.w - 32, r.h - 4), text, false);
+                    if i > 0 {
+                        render::fill_rect(fb, r.x + 16, r.y, r.w - 32, 1, BLACK);
+                    }
+                    spans.push(r);
+                }
+                *area
+            }
+            Some(Overlay::Ask(ask)) => {
+                let w = (g.lw - 160).min(1300);
+                let x = (g.lw - w) / 2;
+                let rows = match &ask.kind {
+                    AskKind::Pick { items, .. } => items.len().min(12),
+                    _ => 1,
+                };
+                let h = 110 + rows * ITEM_H + 150;
+                let y = 180.min(g.bar_y.saturating_sub(h) / 2);
+                let area = Rect::new(x, y, w, h);
+                render::fill_rect(fb, x, y, w, h, WHITE);
+                ui::outline(fb, area, 4, BLACK);
+                let chars = (w - 80) / 16;
+                render::draw_text(fb, &self.ui, x + 40, y + 40, &clip(&ask.title, chars), BLACK, WHITE);
+                let body = Rect::new(x + 40, y + 110, w - 80, ITEM_H - 12);
+                ask.items.clear();
+                let mut yes = "OK".to_string();
+                match &ask.kind {
+                    AskKind::Text { value, hint } => {
+                        ui::outline(fb, body, 2, BLACK);
+                        let shown: String = if value.is_empty() {
+                            format!("_   ({hint})")
+                        } else {
+                            // Keep the end in view, where the typing is.
+                            let n = value.chars().count();
+                            let tail: String = value.chars().skip(n.saturating_sub(chars - 4)).collect();
+                            format!("{tail}_")
+                        };
+                        render::draw_text(fb, &self.ui, body.x + 16, body.y + 22, &clip(&shown, chars - 2), BLACK, WHITE);
+                    }
+                    AskKind::Confirm { detail, yes: label } => {
+                        render::draw_text(fb, &self.ui, body.x, body.y + 22, &clip(detail, chars), BLACK, WHITE);
+                        yes = label.clone();
+                    }
+                    AskKind::Pick { items, multiple } => {
+                        for (i, it) in items.iter().take(12).enumerate() {
+                            let r = Rect::new(body.x, body.y + i * ITEM_H, body.w, ITEM_H - 12);
+                            let mark = match (*multiple, it.on) {
+                                (true, true) => "[x] ",
+                                (true, false) => "[ ] ",
+                                _ => "",
+                            };
+                            ui::line(fb, &self.ui, r, &format!("{mark}{}", it.text), false);
+                            ui::outline(fb, r, 1, BLACK);
+                            ask.items.push(r);
+                        }
+                        if !multiple {
+                            yes.clear();
+                        }
+                    }
+                }
+                let by = y + h - 110;
+                ask.cancel = Rect::new(x + 40, by, 300, 76);
+                ui::button(fb, &self.ui, ask.cancel, "Cancel", false);
+                ask.ok = Rect::default();
+                if !yes.is_empty() {
+                    let bw = (yes.len() * 16 + 80).max(300);
+                    ask.ok = Rect::new(x + w - 40 - bw, by, bw, 76);
+                    ui::button(fb, &self.ui, ask.ok, &yes, true);
+                }
+                area
+            }
+            None => return,
+        };
+        if full {
+            return self.present();
+        }
+        self.dirty.add_rect(area);
+        self.flush();
+    }
+
+    fn draw(&mut self) {
+        if self.overlay.is_some() {
+            // The view under a dialog waits: drawing it would paint over
+            // the dialog.
+            if !self.overlay_drawn {
+                // What a dialog replaced, such as a menu, is cleared first.
+                self.hold = true;
+                let under = match &self.view {
+                    View::Win(wv) if wv.repaint => {
+                        self.draw_win();
+                        true
+                    }
+                    View::List(ListView { drawn: false, .. }) => {
+                        self.draw_list();
+                        true
+                    }
+                    View::Notice { drawn: false, .. } => {
+                        self.draw_notice();
+                        true
+                    }
+                    _ => false,
+                };
+                self.hold = false;
+                self.draw_overlay(under);
+            }
+            return;
+        }
+        match &self.view {
+            View::List(ListView { drawn: false, .. }) => self.draw_list(),
+            View::Notice { drawn: false, .. } => self.draw_notice(),
+            View::Win(_) => self.draw_win(),
+            _ => {}
+        }
+    }
+
+    /// The focused terminal's text, for checking a headless run.
+    fn dump_text(&self) -> String {
+        let View::Win(wv) = &self.view else {
+            return String::new();
+        };
+        let Some(Pane { body: Body::Term(tv), .. }) = wv.panes.get(wv.focus) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for row in 0..tv.term.screen_lines() {
+            let line: String = (0..tv.term.columns())
+                .map(|col| tv.term.grid()[Line(row as i32)][Column(col)].c)
+                .collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+}
+
+fn setting(name: &str) -> Option<String> {
+    std::env::var(format!("REXPAPER_{}", name.to_uppercase()))
+        .ok()
+        .or_else(|| std::fs::read_to_string(format!("{CONFIG_DIR}/{name}")).ok())
+        .map(|s| s.lines().next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn server_target() -> Result<Target, String> {
+    let spec = setting("server")
+        .ok_or_else(|| format!("No Rex server set. Put its Tailscale name in {CONFIG_DIR}/server."))?;
+    Target::parse(&spec)
+}
+
+fn single_instance_lock() -> bool {
+    let path = std::ffi::CString::new("/tmp/rexpaper.lock").unwrap();
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
+        // The fd is leaked on purpose: the lock lives as long as the process.
+        fd < 0 || libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0
+    }
+}
+
+fn env_secs(name: &str) -> Option<Duration> {
+    std::env::var(name).ok()?.parse::<f64>().ok().map(Duration::from_secs_f64)
+}
+
+/// `REXPAPER_TAPS="2:810,300 3.5:100,80-400,80"`: taps and drags at
+/// times, for driving a headless run. `x,y` are canvas pixels.
+fn scripted_taps() -> Vec<(Duration, [i32; 4])> {
+    let xy = |s: &str| -> Option<(i32, i32)> {
+        let (x, y) = s.split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
+    };
+    let mut taps: Vec<(Duration, [i32; 4])> = std::env::var("REXPAPER_TAPS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|t| {
+            let (at, path) = t.split_once(':')?;
+            let (from, to) = path.split_once('-').unwrap_or((path, path));
+            let ((x0, y0), (x1, y1)) = (xy(from)?, xy(to)?);
+            Some((Duration::from_secs_f64(at.parse().ok()?), [x0, y0, x1, y1]))
+        })
+        .collect();
+    taps.reverse();
+    taps
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("rexpaper: fatal: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> std::io::Result<()> {
+    let headless = std::env::var("REXPAPER_HEADLESS").ok();
+    if headless.is_none() && !single_instance_lock() {
+        eprintln!("rexpaper: another instance is running, exiting");
+        return Ok(());
+    }
+    let parse = |d: &'static [u8]| Psf2Font::parse(d).map_err(std::io::Error::other);
+    let fonts = FONTS.iter().map(|f| parse(f.1)).collect::<Result<Vec<_>, _>>()?;
+    let wanted = setting("font");
+    let font_ix = FONTS.iter().position(|f| Some(f.0) == wanted.as_deref()).unwrap_or(1);
+
+    let screen = Screen::open()?;
+    let poller = Arc::new(Poller::new()?);
+    if let Some(fd) = screen.raw_fd() {
+        unsafe { poller.add_with_mode(&FdSource(fd), PollEvent::readable(2), PollMode::Level)? };
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop))?;
+
+    let target = server_target();
+    let mut app = App {
+        screen,
+        canvas: vec![0xff; SCREEN_W * SCREEN_H * 2],
+        rot: Rot(0),
+        fonts,
+        font_ix,
+        ui: parse(FONTS[1].1)?,
+        big: parse(FONTS[2].1)?,
+        palette: palette::Palette::new(),
+        net: Net::new(
+            target.clone().unwrap_or(Target::Unix(String::new())),
+            Arc::clone(&poller),
+        ),
+        ctl: None,
+        kind: if setting("kind").as_deref() == Some("app") { "app" } else { "other" }.to_string(),
+        view: View::Notice {
+            lines: Vec::new(),
+            drawn: true,
+        },
+        overlay: None,
+        overlay_drawn: false,
+        hold: false,
+        settle_at: None,
+        dirty: DirtyRegion::default(),
+        kbd: std::env::var("REXPAPER_KBD").is_ok(),
+        ctrl: false,
+        alt: false,
+        clip: String::new(),
+        banner: None,
+        names: HashMap::new(),
+        retry: None,
+        last_load: Instant::now(),
+    };
+    render::set_canvas_size(SCREEN_W, SCREEN_H);
+    if let Some(r) = std::env::var("REXPAPER_ROT").ok().and_then(|r| r.parse().ok()) {
+        app.rotate(Rot(r));
+    }
+    match &target {
+        Ok(t) => {
+            app.notice(&format!("Connecting to Rex on {}...", t.host()));
+            app.draw();
+            app.connect();
+        }
+        Err(e) => app.notice(e),
+    }
+
+    // Test hooks for headless runs on the Mac.
+    if let (Ok(want), View::List(lv)) = (std::env::var("REXPAPER_OPEN"), &app.view) {
+        let hit = lv.rows.iter().find_map(|r| match &r.kind {
+            RowKind::Window { sid, wid, blocks, .. } => blocks
+                .iter()
+                .find(|b| b.ends_with(&want))
+                .map(|b| (sid.clone(), wid.clone(), b.clone())),
+            _ => None,
+        });
+        match hit {
+            Some((s, w, b)) => app.open(&s, &w, None, Some(&b)),
+            None => eprintln!("rexpaper: no terminal with an ID ending in {want}"),
+        }
+    }
+    let mut type_text = std::env::var("REXPAPER_TYPE").ok();
+    let mut taps = scripted_taps();
+    let mut inject = std::env::var("REXPAPER_INJECT").ok();
+    let type_at = env_secs("REXPAPER_TYPE_AT").unwrap_or(Duration::from_secs(2));
+    let mut drop_at = env_secs("REXPAPER_DROP_AT");
+    let exit_after = env_secs("REXPAPER_EXIT_AFTER");
+    let started = Instant::now();
+
+    let mut keyboards = evkbd::Keyboards::new(true);
+    let mut last_kbd_scan: Option<Instant> = None;
+    let mut events = Events::with_capacity(NonZeroUsize::new(32).unwrap());
+    let mut clock = (Instant::now(), SystemTime::now());
+
+    'main: loop {
+        if stop.load(Ordering::Relaxed) || exit_after.is_some_and(|d| started.elapsed() >= d) {
+            break;
+        }
+        events.clear();
+        let nap = match app.settle_at {
+            Some(at) => at.saturating_duration_since(Instant::now()).min(Duration::from_millis(300)),
+            None => Duration::from_millis(300),
+        };
+        poller.wait(&mut events, Some(nap))?;
+        if app.settle_at.is_some_and(|at| Instant::now() >= at) {
+            app.settle_at = None;
+            app.show_all();
+        }
+
+        // While the tablet sleeps the wall clock runs and this one doesn't.
+        // A gap between them means the connections are dead: don't wait
+        // for the keepalive to find out.
+        let now = (Instant::now(), SystemTime::now());
+        let wall = now.1.duration_since(clock.1).unwrap_or_default();
+        let slept = wall.saturating_sub(now.0 - clock.0) > Duration::from_secs(8);
+        clock = now;
+        if (slept || drop_at.is_some_and(|d| started.elapsed() >= d)) && app.ctl.is_some() {
+            drop_at = None;
+            app.lost("the tablet slept");
+        }
+
+        let mut rotation = None;
+        for ev in events.iter() {
+            match ev.key {
+                2 => {
+                    let Ok(drained) = app.screen.drain_events() else {
+                        break 'main; // the window was closed
+                    };
+                    rotation = drained.rotation.or(rotation);
+                    for input in drained.inputs {
+                        app.touch(input);
+                    }
+                }
+                k if k >= KBD_KEY_BASE => {
+                    let fd = (k - KBD_KEY_BASE) as RawFd;
+                    let (presses, gone) = keyboards.read(fd);
+                    for p in presses {
+                        app.key(p.action, p.ctrl, p.alt);
+                    }
+                    if gone {
+                        let _ = poller.delete(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) });
+                        keyboards.remove(fd);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Keyboards come and go (Type Folio, Bluetooth): look again now and then.
+        if last_kbd_scan.is_none_or(|t| t.elapsed() >= KBD_SCAN) {
+            last_kbd_scan = Some(Instant::now());
+            for fd in keyboards.scan() {
+                unsafe {
+                    poller.add_with_mode(
+                        &FdSource(fd),
+                        PollEvent::readable(KBD_KEY_BASE + fd as usize),
+                        PollMode::Level,
+                    )?;
+                }
+            }
+        }
+
+        while let Some((id, msg)) = app.net.pop() {
+            app.net_msg(id, msg);
+        }
+
+        if let Some(r) = rotation {
+            let rot = Rot::from_appload(r, false);
+            if rot != app.rot {
+                app.rotate(rot);
+            }
+        }
+
+        if app.ctl.is_none() && app.retry.as_ref().is_some_and(|r| Instant::now() >= r.at) {
+            app.draw();
+            app.connect();
+        }
+
+        // Reload the list a moment after the server says something changed,
+        // but not so often that the screen keeps flashing.
+        if app.overlay.is_none()
+            && app.last_load.elapsed() >= Duration::from_secs(3)
+            && matches!(&app.view, View::List(ListView { stale: Some(t), .. }) if t.elapsed() >= Duration::from_secs(1))
+        {
+            app.show_list();
+        }
+        app.tick();
+        if app.banner.as_ref().is_some_and(|b| b.1.elapsed() >= Duration::from_secs(30)) {
+            app.banner = None;
+            app.touch_chrome();
+        }
+
+        while taps.last().is_some_and(|t| started.elapsed() >= t.0) {
+            let (_, [x0, y0, x1, y1]) = taps.pop().unwrap();
+            let steps = [
+                (qtfb::INPUT_TOUCH_PRESS, x0, y0),
+                (qtfb::INPUT_TOUCH_UPDATE, x1, y1),
+                (qtfb::INPUT_TOUCH_RELEASE, x1, y1),
+            ];
+            for (input_type, x, y) in steps {
+                let (px, py) = app.rot.to_phys(x as usize, y as usize, SCREEN_W, SCREEN_H);
+                app.touch(qtfb::InputEvent { input_type, dev_id: 0, x: px as i32, y: py as i32, d: 0 });
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            // A control message as if the server had sent it.
+            if let Some(text) = inject.take() {
+                app.control_msg(&text);
+            }
+        }
+        if started.elapsed() >= type_at && (matches!(app.view, View::Win(_)) || app.overlay.is_some()) {
+            if let Some(text) = type_text.take() {
+                for c in text.chars() {
+                    match c {
+                        '\n' => app.key(KeyAction::Enter, false, false),
+                        c => app.key(KeyAction::Char(c), false, false),
+                    }
+                }
+            }
+        }
+
+        app.draw();
+    }
+
+    eprintln!("rexpaper: exiting");
+    if let Some(path) = &headless {
+        let _ = std::fs::write(format!("{path}.txt"), app.dump_text());
+    }
+    // Hand the terminals back before the connection goes.
+    if let View::Win(wv) = &app.view {
+        let sid = wv.session_id.clone();
+        let _ = app.call("session.detach", json!({"session_id": sid}));
+    }
+    app.screen.finish();
+    // Dropping the connections sends their close frames: give the threads
+    // a moment, so the server sees a client that left, not one that vanished.
+    app.view = View::Notice { lines: Vec::new(), drawn: true };
+    app.ctl = None;
+    std::thread::sleep(Duration::from_millis(200));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view() -> Value {
+        json!({"windows": [{
+            "window_id": "window:1",
+            "focused_block_id": "block:b",
+            "layers": [
+                {"kind": "tiled", "layout": {"rect": [0, 0, 1, 1], "split": {
+                    "direction": "horizontal", "ratio": 0.5,
+                    "before": {"rect": [0, 0, 0.5, 1], "block_id": "block:a"},
+                    "after": {"rect": [0.5, 0, 0.5, 1], "split": {
+                        "direction": "vertical", "ratio": 0.5,
+                        "before": {"rect": [0.5, 0, 0.5, 0.5], "block_id": "block:b"},
+                        "after": {"rect": [0.5, 0.5, 0.5, 0.5], "block_id": "block:c"}}}}},
+                 "blocks": [
+                    {"block_id": "block:a", "creator_name": TERMINAL, "label": "shell"},
+                    {"block_id": "block:b", "creator_name": TERMINAL},
+                    {"block_id": "block:c", "creator_name": "com.superlogical.onboarding"}]},
+                {"kind": "floating", "layout": null, "blocks": []},
+                {"kind": "floating", "state": "minimized", "layout": null, "blocks": []}]}]})
+    }
+
+    #[test]
+    fn window_layout() {
+        let info = window_info(&view(), "window:1").unwrap();
+        let ids: Vec<&str> = info.panes.iter().map(|p| p.0.as_str()).collect();
+        assert_eq!(ids, ["block:a", "block:b", "block:c"]);
+        assert_eq!(info.panes[2].1, [0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(info.panes[2].2, "com.superlogical.onboarding");
+        assert_eq!(info.focused.as_deref(), Some("block:b"));
+        assert_eq!(info.floating, 1);
+        assert!(window_info(&view(), "window:2").is_none());
+    }
+
+    #[test]
+    fn panes_tile_the_canvas() {
+        let info = window_info(&view(), "window:1").unwrap();
+        let r: Vec<Rect> = info.panes.iter().map(|p| frac_rect(p.1, 1620, 2004)).collect();
+        assert_eq!(r[0], Rect::new(0, 0, 810, 2004));
+        assert_eq!(r[1], Rect::new(810, 0, 810, 1002));
+        assert_eq!(r[2], Rect::new(810, 1002, 810, 1002));
+        // Inside a shared tab a pane gives up its title strip and borders.
+        assert_eq!(inner(r[1], true), Rect::new(812, TITLE_H, 804, 1002 - TITLE_H - 4));
+        assert_eq!(inner(r[1], false), r[1]);
+    }
+
+    #[test]
+    fn status_picks_the_most_urgent() {
+        let recs = json!([{"state": "working"}, {"state": "blocked"}, {"state": "done"}]);
+        assert_eq!(status_of(&recs), "[blocked]");
+        assert_eq!(status_of(&json!([])), "");
+    }
+}
