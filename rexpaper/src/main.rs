@@ -518,6 +518,10 @@ struct Ink {
     /// its rub, how many typed characters the rub has deleted, and whether
     /// it has rubbed out any ink.
     erasing: Option<((i32, i32), i32, i32, usize, bool)>,
+    /// The screen is in its quickest refresh mode, for ink.
+    fast: bool,
+    /// The pen is within reach of the screen.
+    near: bool,
     /// Ink was removed: the next full refresh also clears its ghosts.
     deghost: bool,
 }
@@ -1973,7 +1977,8 @@ impl App {
                     self.ink.erasing = Some((p, p.0, p.0, 0, false));
                     self.erase(p);
                 } else if writes {
-                    if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
+                    if !self.ink.fast {
+                        self.ink.fast = true;
                         self.screen.set_fast(true);
                     }
                     self.ink.down = true;
@@ -2001,6 +2006,18 @@ impl App {
                         self.ink.strokes.last_mut().unwrap().push(p);
                         self.ink_line(last, p);
                     }
+                }
+            }
+            // Switching the screen to its quickest refresh takes a moment,
+            // which made the start of the first stroke lag. Do it when the
+            // pen comes near, before it touches.
+            PenEv::Near(near) => {
+                self.ink.near = near;
+                let inked = !self.ink.strokes.is_empty() || !self.ink.sent.is_empty();
+                let fast = (near && matches!(self.view, View::Win(_))) || inked;
+                if fast != self.ink.fast {
+                    self.ink.fast = fast;
+                    self.screen.set_fast(fast);
                 }
             }
             PenEv::Up => {
@@ -2063,7 +2080,10 @@ impl App {
             self.banner = None;
         }
         if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
-            self.screen.set_fast(false);
+            if !self.ink.near {
+                self.ink.fast = false;
+                self.screen.set_fast(false);
+            }
         }
         if let View::Win(wv) = &mut self.view {
             wv.repaint = true;
@@ -2079,7 +2099,10 @@ impl App {
             self.ink.strokes.clear();
         }
         if self.ink.strokes.is_empty() {
-            self.screen.set_fast(false);
+            if !self.ink.near {
+                self.ink.fast = false;
+                self.screen.set_fast(false);
+            }
         }
         if let View::Win(wv) = &mut self.view {
             wv.repaint = true;

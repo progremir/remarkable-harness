@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import zlib
 
 MODEL = os.environ.get("SCRIBE_MODEL", "sonnet")
@@ -38,28 +39,35 @@ Rules:
 - Several handwritten lines are one text: join them with single spaces.
 - If they finish with a return arrow (a bent arrow like the Enter key) or underline the whole text twice, they want it submitted: end your reply with <enter>.
 - A lone return arrow means just <enter>.
-- If nothing is readable, reply with exactly <unreadable>."""
+- A small mark on its own is punctuation or a symbol, and they mean it: a dot is `.`, a dot with a tail is `,`, a short flat line is `-`, a long flat line is `_`, a leaning line is `/` or `\\`, an upright line as tall as a letter is `|`, an upright line over a dot is `!`, a hook over a dot is `?`, two dots are `:`, a dot over a tail is `;`, one or two short ticks are `'` or `"`, and so on for `* ~ = + < > ( ) [ ] { } # @ $ % & ^`. Give your best reading of a single mark. Never call a clear mark unreadable.
+- Every picture is drawn at the same scale, and the note with it says how tall their letters usually are. Use that to tell a dot from a line, and a comma from a slash.
+- If the picture really holds nothing you can read, such as a scribble that is no character at all, reply with exactly <unreadable>."""
 
 
-def strokes_png(strokes, scale=0.5, pad=24):
-    """Pen strokes (screen pixels) -> PNG bytes, cropped to the ink."""
+SCALE = 0.5          # picture pixels per screen pixel, the same for every picture
+MIN_W, MIN_H = 320, 200   # so a lone dot is a dot on a page, not a blob that fills the frame
+
+
+def strokes_png(strokes, pad=24):
+    """Pen strokes (screen pixels) -> PNG bytes at a fixed scale, the ink in the middle."""
     xs = [x for s in strokes for x, _ in s]
     ys = [y for s in strokes for _, y in s]
-    x0, y0 = min(xs) - pad, min(ys) - pad
-    w = int((max(xs) + pad - x0) * scale) + 1
-    h = int((max(ys) + pad - y0) * scale) + 1
+    w = max(MIN_W, int((max(xs) - min(xs) + 2 * pad) * SCALE) + 1)
+    h = max(MIN_H, int((max(ys) - min(ys) + 2 * pad) * SCALE) + 1)
+    x0 = (min(xs) + max(xs)) / 2 - w / SCALE / 2
+    y0 = (min(ys) + max(ys)) / 2 - h / SCALE / 2
     img = [bytearray(b"\xff" * w) for _ in range(h)]
 
     def dot(x, y):
         xi, yi = int(x), int(y)
-        for yy in (yi, yi + 1):
+        for yy in (yi - 1, yi, yi + 1):
             if 0 <= yy < h:
-                for xx in (xi, xi + 1):
+                for xx in (xi - 1, xi, xi + 1):
                     if 0 <= xx < w:
                         img[yy][xx] = 0
 
     for s in strokes:
-        pts = [((x - x0) * scale, (y - y0) * scale) for x, y in s]
+        pts = [((x - x0) * SCALE, (y - y0) * SCALE) for x, y in s]
         dot(*pts[0])
         for (ax, ay), (bx, by) in zip(pts, pts[1:]):
             n = int(max(abs(bx - ax), abs(by - ay))) + 1
@@ -72,6 +80,13 @@ def strokes_png(strokes, scale=0.5, pad=24):
     raw = b"".join(b"\x00" + bytes(r) for r in img)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def ink_size(strokes):
+    """Width and height of the ink, in picture pixels."""
+    xs = [x for s in strokes for x, _ in s]
+    ys = [y for s in strokes for _, y in s]
+    return (max(xs) - min(xs)) * SCALE, (max(ys) - min(ys)) * SCALE
 
 
 class Reader:
@@ -104,14 +119,14 @@ class Reader:
                 pass
             self.proc = None
 
-    def read(self, png):
+    def read(self, png, note):
         if self.proc is None or self.proc.poll() is not None or self.turns >= MAX_TURNS:
             self.start()
         self.turns += 1
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                          "data": base64.b64encode(png).decode()}},
-            {"type": "text", "text": "(handwriting)"},
+            {"type": "text", "text": note},
         ]
         self.proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n")
         self.proc.stdin.flush()
@@ -167,9 +182,13 @@ def main():
         sys.stdout.write(out)
         sys.stdout.flush()
 
+    home = os.path.expanduser("~/.config/rexpaper/scribe")
+    os.makedirs(home, exist_ok=True)
     reader = Reader()
     reader.start()  # warm up while they are still writing
     say({"ready": 1}, "ready")
+    # How tall this person writes: taken from their words, used for lone marks.
+    letter = 40.0
     for raw in lines(fd):
         try:
             msg = json.loads(raw)
@@ -179,10 +198,26 @@ def main():
             continue
         if not strokes:
             continue
+        w, h = ink_size(strokes)
+        if w > 2.5 * h and h > 12:  # a word or more: its height is the height of a line of writing
+            letter = 0.7 * letter + 0.3 * (h * 0.6)
+        note = (f"(handwriting; the ink is {w:.0f} x {h:.0f} pixels, "
+                f"and their lower-case letters are about {letter:.0f} pixels tall)")
+        png = strokes_png(strokes)
         try:
-            say({"id": rid, "text": tidy(reader.read(strokes_png(strokes)))}, f"done {rid}")
+            answer = reader.read(png, note)
+            say({"id": rid, "text": tidy(answer)}, f"done {rid}")
         except Exception as e:  # the client shows this instead of typing
+            answer = f"error: {e}"
             say({"id": rid, "error": str(e)[:200]}, f"done {rid}")
+        # The last pictures and what was made of them, to see why a reading went wrong.
+        try:
+            with open(os.path.join(home, f"ink-{rid % 20:02d}.png"), "wb") as f:
+                f.write(png)
+            with open(os.path.join(home, "log"), "a") as f:
+                f.write(f"{time.strftime('%F %T')} ink-{rid % 20:02d}.png {note} -> {answer!r}\n")
+        except OSError:
+            pass
     reader.stop()
 
 

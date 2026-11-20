@@ -119,6 +119,8 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - The ink goes away when its text is typed, with a slow refresh that leaves no ghost of it.
   - The eraser end of the pen rubs out scribbles, a stroke at a time. Rubbing out everything that is being read cancels it, and nothing is typed.
   - With no scribbles on screen, the eraser deletes typed text from the cursor backwards: one character for each character's width you rub across, and one for a dab.
+  - A mark on its own is read as punctuation or a symbol: a dot, a comma, a dash, a slash and so on.
+  - The reader keeps its last 20 pictures and a log of what it made of them in `~/.config/rexpaper/scribe/` on the Mac, to see why a reading went wrong.
   - A finger still scrolls and taps. The pen taps the key row, the bar and the menus.
   - Claude reads the ink on the Mac, through its Claude Code login, so `claude` must be installed there. It takes 3 to 5 seconds. `SCRIBE_MODEL` in the Mac's shell profile picks the model (default `sonnet`).
 - **Notifications:** the bar shows a line when a program in any terminal reports that it is blocked, done or failed, or sends a desktop notification. Tap the line to dismiss it.
