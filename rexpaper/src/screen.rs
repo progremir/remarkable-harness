@@ -63,10 +63,9 @@ impl Screen {
         }
     }
 
-    /// `fast` trades some ghosting for the quickest refresh, for ink.
-    pub fn set_fast(&self, fast: bool) {
+    /// Choose how the e-ink is driven: see the `MODE_` constants.
+    pub fn set_mode(&self, mode: i32) {
         if let Screen::Qtfb(c) = self {
-            let mode = if fast { qtfb::REFRESH_MODE_UFAST } else { qtfb::REFRESH_MODE_FAST };
             let _ = c.set_refresh_mode(mode);
         }
     }

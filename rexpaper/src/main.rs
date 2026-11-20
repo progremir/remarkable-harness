@@ -97,8 +97,15 @@ const SHELL: &str = "com.superlogical.terminal.shell";
 const SCRIBE: &str = "rexpaper scribe";
 /// How long the pen rests before the writing is sent off to be read.
 const INK_PAUSE: Duration = Duration::from_millis(1300);
-/// How long the place of removed ink stays black before it is drawn again.
-const FLASH: Duration = Duration::from_millis(180);
+// How AppLoad drives the e-ink (its REFRESH_MODE values).
+/// Quickest, and leaves ghosts: only while the pen is writing.
+const MODE_INK: i32 = 0;
+/// Quick and clean enough for text: the normal mode.
+const MODE_TEXT: i32 = 1;
+/// Slower and leaves no ghost: for the update that removes ink.
+const MODE_CLEAN: i32 = 3;
+/// How long the clean mode stays on for an update to be drawn in it.
+const CLEAN_FOR: Duration = Duration::from_millis(350);
 
 const FONTS: [(&str, &[u8]); 3] = [
     ("12x24", include_bytes!("../fonts/spleen-12x24.psfu")),
@@ -521,8 +528,8 @@ struct Ink {
     /// its rub, how many typed characters the rub has deleted, and whether
     /// it has rubbed out any ink.
     erasing: Option<((i32, i32), i32, i32, usize, bool)>,
-    /// The screen is in its quickest refresh mode, for ink.
-    fast: bool,
+    /// When the pen last came near or left.
+    away: Option<Instant>,
     /// The pen is within reach of the screen.
     near: bool,
     /// A slow refresh that clears ghosts is due, with the next full one.
@@ -596,14 +603,12 @@ struct App {
     /// Where ink was removed: this part of the screen is drawn again.
     repair: Option<Rect>,
     /// Where ink was removed and its ghost is still to be cleared: that
-    /// part is first turned black, then drawn again a moment later. Driving
-    /// the pixels both ways wipes the ghost without a full-screen refresh.
+    /// part is drawn again in the clean mode once the pen is up.
     flash: Option<Rect>,
     /// What the eraser has cleared in the rub that is under way.
-    rubbed: Option<Rect>,
-    repair_at: Option<(Rect, Instant)>,
-    /// The pen has been used here before, so tabs open ready for ink.
-    pen_user: bool,
+    /// The screen's mode now, and when a spell of the clean mode ends.
+    mode: i32,
+    clean_until: Option<Instant>,
 }
 
 /// Where the parts of the screen are.
@@ -1073,7 +1078,8 @@ impl App {
     }
 
     fn show_list(&mut self) {
-        self.ink_mode(false);
+        self.clean_until = None;
+        self.set_mode(MODE_TEXT);
         let Some(ctl) = self.ctl.as_mut() else {
             return self.connect();
         };
@@ -1214,9 +1220,7 @@ impl App {
         match self.open_window(sid, wid, name, focus) {
             Ok(wv) => {
                 self.view = View::Win(Box::new(wv));
-                if self.pen_user && self.raw_pen {
-                    self.ink_mode(true);
-                }
+
                 if let Some(old) = old {
                     self.send("session.detach", json!({"session_id": old}));
                 }
@@ -2000,10 +2004,15 @@ impl App {
                     && matches!(&self.view, View::Win(wv) if !wv.select)
                     && (p.1 as usize) < g.keys_y;
                 if writes && eraser {
+                    // What the eraser rubs out is drawn away in the clean
+                    // mode, so it leaves no ghost. Speed doesn't matter here.
+                    self.clean_until = None;
+                    self.set_mode(MODE_CLEAN);
                     self.ink.erasing = Some((p, p.0, p.0, 0, false));
                     self.erase(p);
                 } else if writes {
-                    self.ink_mode(true);
+                    self.clean_until = None;
+                    self.set_mode(MODE_INK);
                     self.ink.down = true;
                     self.ink.strokes.push(vec![p]);
                     self.ink_line(p, p);
@@ -2032,9 +2041,11 @@ impl App {
                 }
             }
             PenEv::Near(near) => {
+                // Get ready for ink as the pen approaches, not when it lands.
                 self.ink.near = near;
-                if near && matches!(self.view, View::Win(_)) {
-                    self.ink_mode(true);
+                self.ink.away = Some(Instant::now());
+                if near && matches!(self.view, View::Win(_)) && self.clean_until.is_none() {
+                    self.set_mode(MODE_INK);
                 }
             }
             PenEv::Up => {
@@ -2042,9 +2053,7 @@ impl App {
                     let e = tap(qtfb::INPUT_PEN_RELEASE, p);
                     self.touch(e);
                 } else if let Some((_, _, _, deleted, inked)) = self.ink.erasing.take() {
-                    if let Some(r) = self.rubbed.take() {
-                        self.flash = Some(self.flash.map_or(r, |o| o.union(r)));
-                    }
+                    self.clean_until = Some(Instant::now() + CLEAN_FOR);
                     // A dab with the eraser deletes one character.
                     if deleted == 0 && !inked && self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
                         self.type_bytes(vec![0x7f]);
@@ -2103,18 +2112,10 @@ impl App {
         }
     }
 
-    /// Switch the screen between its quickest refresh, for ink, and the
-    /// cleaner one. AppLoad redraws the whole window when the mode changes,
-    /// which stalls a stroke in progress, so this happens as rarely as it
-    /// can: on the way into a tab and out of it, not around each scribble.
-    fn ink_mode(&mut self, fast: bool) {
-        if fast != self.ink.fast {
-            self.ink.fast = fast;
-            self.screen.set_fast(fast);
-        }
-        if fast && !self.pen_user {
-            self.pen_user = true;
-            let _ = std::fs::write(format!("{CONFIG_DIR}/pen"), "used\n");
+    fn set_mode(&mut self, mode: i32) {
+        if mode != self.mode {
+            self.mode = mode;
+            self.screen.set_mode(mode);
         }
     }
 
@@ -2131,11 +2132,8 @@ impl App {
         let (x1, y1) = ((x1 + 7).min(lw), (y1 + 7).min(lh));
         let r = Rect::new(x0 as usize, y0 as usize, (x1 - x0).max(1) as usize, (y1 - y0).max(1) as usize);
         if self.ink.erasing.is_some() {
-            // Under the eraser the ink goes at once, so the rub shows. The
-            // flash that wipes its ghost waits for the eraser to lift:
-            // one flash for the whole rub.
+            // Under the eraser the ink goes at once, so the rub shows.
             self.repair = Some(self.repair.map_or(r, |o| o.union(r)));
-            self.rubbed = Some(self.rubbed.map_or(r, |o| o.union(r)));
         } else {
             self.flash = Some(self.flash.map_or(r, |o| o.union(r)));
         }
@@ -2721,16 +2719,19 @@ impl App {
         };
         let full = wv.repaint;
         let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
-        // Where ink was removed: black it out now, between two strokes.
+        // Where read ink is to go: take it away between two strokes, in
+        // the clean mode, so that no ghost of it stays.
         if let Some(r) = self.flash.filter(|_| !full && !self.ink.down && self.ink.erasing.is_none()) {
             self.flash = None;
-            render::fill_rect(&mut self.canvas, r.x, r.y, r.w, r.h, BLACK);
-            self.dirty.add_rect(r);
-            let r = self.repair_at.map_or(r, |o| o.0.union(r));
-            self.repair_at = Some((r, Instant::now() + FLASH));
+            self.repair = Some(self.repair.map_or(r, |o| o.union(r)));
+            self.clean_until = Some(Instant::now() + CLEAN_FOR);
+            if self.mode != MODE_CLEAN {
+                self.mode = MODE_CLEAN;
+                self.screen.set_mode(MODE_CLEAN);
+            }
         }
         if full {
-            (self.flash, self.repair_at, self.rubbed) = (None, None, None);
+            self.flash = None;
         }
         // Then wipe it, and draw what was under it again.
         let repair = self.repair.take().filter(|_| !full);
@@ -3150,9 +3151,8 @@ fn run() -> std::io::Result<()> {
         raw_pen: false,
         repair: None,
         flash: None,
-        rubbed: None,
-        repair_at: None,
-        pen_user: std::fs::metadata(format!("{CONFIG_DIR}/pen")).is_ok(),
+        mode: MODE_TEXT,
+        clean_until: None,
     };
     render::set_canvas_size(SCREEN_W, SCREEN_H);
     if let Some(r) = std::env::var("REXPAPER_ROT").ok().and_then(|r| r.parse().ok()) {
@@ -3212,15 +3212,21 @@ fn run() -> std::io::Result<()> {
             break;
         }
         events.clear();
-        let nap = [app.settle_at, app.repair_at.map(|r| r.1)]
+        let nap = [app.settle_at, app.clean_until]
             .into_iter()
             .flatten()
             .map(|at| at.saturating_duration_since(Instant::now()))
             .fold(Duration::from_millis(300), Duration::min);
         poller.wait(&mut events, Some(nap))?;
-        if let Some((r, _)) = app.repair_at.filter(|r| Instant::now() >= r.1) {
-            app.repair_at = None;
-            app.repair = Some(app.repair.map_or(r, |o| o.union(r)));
+        if app.clean_until.is_some_and(|at| Instant::now() >= at) {
+            app.clean_until = None;
+            let near = app.ink.near && matches!(app.view, View::Win(_));
+            app.set_mode(if near { MODE_INK } else { MODE_TEXT });
+        }
+        // The pen has gone: back to the mode that draws text cleanly.
+        let away = !app.ink.near && !app.ink.down && app.ink.away.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+        if away && app.mode == MODE_INK && app.clean_until.is_none() {
+            app.set_mode(MODE_TEXT);
         }
         if app.settle_at.is_some_and(|at| Instant::now() >= at) {
             app.settle_at = None;

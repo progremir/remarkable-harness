@@ -116,7 +116,7 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - For AppLoad's keyboard, swipe down from the top edge and tap the keyboard button at the top left. On the first key, the terminals and the bar move up to leave room for it. When you close the keyboard, choose **Use the whole screen** in the menu.
 - **Handwriting:** write on a tab with the pen, anywhere over the terminals. About a second after you lift the pen, the ink is read and typed at the cursor of the pane you are in.
   - The text is not submitted. To submit it, end with a return arrow (the bent arrow on an Enter key), or tap **Enter**.
-  - The ink goes away when its text is typed. Only the part of the screen it was on is drawn again, so you can keep writing the next word meanwhile. That part flashes black first, which wipes the ghost that fast ink leaves. **Refresh screen** in the menu clears anything that still stays.
+  - The ink goes away when its text is typed. Only the part of the screen it was on is drawn again, between two strokes, so you can keep writing the next word. **Refresh screen** in the menu clears any ghost that stays.
   - The eraser end of the pen rubs out scribbles, a stroke at a time. Rubbing out everything that is being read cancels it, and nothing is typed.
   - With no scribbles on screen, the eraser deletes typed text from the cursor backwards: one character for each character's width you rub across, and one for a dab.
   - Spaces: the reader sees the line up to the cursor. It puts a space before a new word that follows a word, and none before punctuation, a file extension or the rest of a path. For a space by itself, tap **Space**, or draw the space sign: a flat line with both ends turned up.
@@ -132,7 +132,8 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - It connects through `tailscale nc` to port 443 of the server and speaks TLS and WebSocket itself (`src/wire.rs`).
   - Commands and events are JSON on the control connection, `/api/control` (`src/rex.rs`).
   - Each terminal on screen has a data connection, `/api/data`, that streams its output (`src/stream.rs`). The stream starts with a snapshot in Ghostty's format, which this client can't read. It skips the snapshot and asks for the screen as escape sequences with `com.superlogical.terminal.format`.
-  - Nothing in the pen's path waits for the server, and the screen stays in its fastest refresh mode for as long as a tab is open once the pen has been used. Changing the mode makes AppLoad redraw the window, which stalls a stroke.
+  - Nothing in the pen's path waits for the server.
+  - AppLoad has several ways to drive the e-ink, and the client picks one for the moment: a quick, clean one for text; the quickest one, which leaves ghosts, only while the pen is near and writing; and a slower one that leaves none for the update that takes ink away, and while the eraser is down.
   - That read races with the stream, so the client reads the screen once more when the terminal goes quiet.
   - Handwriting goes through Rex too. The client starts `mac/scribe.py` in a terminal block of its own (`session.new_block`, labelled `rexpaper scribe`), types the strokes into it as a line of JSON, and reads the text off its screen when the block changes its title. No window shows that block, and it closes when the app does.
   - The output feeds the same emulator and e-ink renderer as PaperTerm. Keys go back with `com.superlogical.terminal.write`.
