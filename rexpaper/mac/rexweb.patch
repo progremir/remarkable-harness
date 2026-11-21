@@ -1,5 +1,5 @@
 diff --git a/Sources/RexWeb.swift b/Sources/RexWeb.swift
-index 74497c2..fb9c2dc 100644
+index 74497c2..605e19f 100644
 --- a/Sources/RexWeb.swift
 +++ b/Sources/RexWeb.swift
 @@ -117,7 +117,9 @@ enum RexChrome {
@@ -25,6 +25,15 @@ index 74497c2..fb9c2dc 100644
    var layoutKey = ""
    var settleUntil = Date.distantPast
    var lastActive = Date()
+@@ -250,7 +257,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
+     window.hasShadow = false
+     window.backgroundColor = .clear
+     window.isOpaque = false
+-    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
++    window.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle, .fullScreenAuxiliary]
+ 
+     let root = NSView()
+     root.wantsLayer = true
 @@ -315,7 +322,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
      forwardButton.frame = NSRect(x: 30, y: 4, width: 24, height: 22)
      reloadButton.frame = NSRect(x: 54, y: 4, width: 24, height: 22)
