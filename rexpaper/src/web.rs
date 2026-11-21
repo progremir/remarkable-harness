@@ -64,6 +64,11 @@ pub struct WebView {
     /// The page's own size in CSS pixels: the picture shows exactly this.
     pub vw: f64,
     pub vh: f64,
+    /// How far down the page is scrolled and how tall it is, in CSS pixels.
+    pub y: f64,
+    pub full: f64,
+    /// The button just pressed, shown dark until the page answers.
+    pub held: Option<BarHit>,
     pub url: String,
     pub title: String,
     /// The page's focus is in a text field.
@@ -84,6 +89,9 @@ impl WebView {
             hash: String::new(),
             vw: 0.0,
             vh: 0.0,
+            y: 0.0,
+            full: 0.0,
+            held: None,
             url: String::new(),
             title: String::new(),
             edit: false,
@@ -118,6 +126,35 @@ impl WebView {
         Ok(())
     }
 
+    /// Move the picture by a drag of `dy` canvas pixels (up is positive),
+    /// as far as the page can scroll, so the drag shows before the Mac's
+    /// picture of the scrolled page arrives. The uncovered strip is blank.
+    pub fn shift(&mut self, dy: i32) {
+        if self.iw == 0 || self.vw <= 0.0 {
+            return;
+        }
+        let px = self.iw as f64 / self.vw;
+        let (up, down) = (self.y * px, ((self.full - self.vh - self.y) * px).max(0.0));
+        let dy = (dy as f64).clamp(-up, down).round() as i64;
+        let (row, rows) = (self.iw * 2, self.ih);
+        let n = dy.unsigned_abs() as usize;
+        if n == 0 {
+            return;
+        }
+        if n >= rows {
+            self.img.fill(0xff);
+        } else if dy > 0 {
+            self.img.copy_within(n * row.., 0);
+            self.img[(rows - n) * row..].fill(0xff);
+        } else {
+            self.img.copy_within(..(rows - n) * row, n * row);
+            self.img[..n * row].fill(0xff);
+        }
+        self.y += dy as f64 / px;
+        self.hash.clear();
+        self.drawn = false;
+    }
+
     /// The point of the page, in CSS pixels, under a point of the canvas.
     pub fn page_point(&self, x: i32, y: i32, r: Rect) -> Option<(f64, f64)> {
         let (px, py) = (x - r.x as i32, y - r.y as i32);
@@ -141,9 +178,9 @@ impl WebView {
         render::fill_rect(fb, r.x, r.y, r.w, r.h, WHITE);
         for (hit, b) in bar_parts(r) {
             match hit {
-                BarHit::Back => ui::button(fb, font, b, "\u{2190}", false),
-                BarHit::Forward => ui::button(fb, font, b, "\u{2192}", false),
-                BarHit::Reload => ui::button(fb, font, b, "Reload", false),
+                BarHit::Back => ui::button(fb, font, b, "\u{2190}", self.held == Some(hit)),
+                BarHit::Forward => ui::button(fb, font, b, "\u{2192}", self.held == Some(hit)),
+                BarHit::Reload => ui::button(fb, font, b, "Reload", self.held == Some(hit)),
                 BarHit::Smaller => ui::button(fb, font, b, "A-", false),
                 BarHit::Bigger => ui::button(fb, font, b, "A+", false),
                 BarHit::Address => {

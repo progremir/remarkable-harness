@@ -563,6 +563,9 @@ struct Scribe {
     queued: Vec<String>,
     writing: Option<String>,
     polled: Instant,
+    /// Its title changed while its screen was being read: the answer on
+    /// the way may be from before the change, so read again after it.
+    stale: bool,
 }
 
 /// What a request to the helper was for.
@@ -1086,7 +1089,7 @@ impl App {
                 self.scribe = None;
                 for (i, (sid, bid)) in scribes.into_iter().enumerate() {
                     if i == 0 {
-                        self.scribe = Some(Scribe { sid, bid, creating: None, polling: None, ready: true, queued: Vec::new(), writing: None, polled: Instant::now() });
+                        self.scribe = Some(Scribe { sid, bid, creating: None, polling: None, ready: true, queued: Vec::new(), writing: None, polled: Instant::now(), stale: false });
                     } else {
                         self.send("block.close", json!({"session_id": sid, "block_id": bid}));
                     }
@@ -2019,7 +2022,7 @@ impl App {
                 } else if wv.drag.is_some_and(|d| d.0 == ev.dev_id) {
                     let (id, last_y) = wv.drag.unwrap();
                     let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
-                    if let Some(Pane { body: Body::Web(wb), rect: Some(rect), block_id, .. }) = wv.panes.get(wv.focus) {
+                    if let Some(Pane { body: Body::Web(wb), rect: Some(rect), block_id, .. }) = wv.panes.get_mut(wv.focus) {
                         // On a page a tap clicks, and a drag scrolls when the
                         // finger lifts: e-ink can't follow a moving page.
                         if release {
@@ -2039,6 +2042,16 @@ impl App {
                                 None => Some(json!({"web": "scroll", "dy": (y0 - y) as f64 * wb.scale()})),
                             };
                             wv.drag = None;
+                            // Show at once that the touch was taken: the
+                            // real picture is a trip to the Mac away.
+                            match bar {
+                                Some(hit) if act.is_some() => {
+                                    wb.held = Some(hit);
+                                    wb.drawn = false;
+                                }
+                                None if !tap => wb.shift(y0 - y),
+                                _ => {}
+                            }
                             if let Some(act) = act {
                                 self.web_act(&bid, act);
                             } else {
@@ -2368,6 +2381,7 @@ impl App {
             ready: false,
             queued: Vec::new(), writing: None,
             polled: Instant::now(),
+            stale: false,
         });
         Ok(())
     }
@@ -2413,6 +2427,7 @@ impl App {
             return;
         }
         let data: String = std::mem::take(&mut sc.queued).concat();
+        trace(&format!("write {}", data.chars().take(60).collect::<String>().trim()));
         sc.writing = Some(ctl.send(
             &format!("{TERMINAL}.write"),
             json!({"session_id": sc.sid, "block_id": sc.bid, "args": {"data": data}}),
@@ -2459,9 +2474,12 @@ impl App {
         };
         let stuck = sc.polled.elapsed() >= Duration::from_secs(8);
         if sc.bid.is_empty() || (sc.polling.is_some() && !stuck) {
+            sc.stale = sc.polling.is_some();
             return;
         }
+        sc.stale = false;
         sc.polled = Instant::now();
+        trace("poll");
         sc.polling = Some(ctl.send(
             &format!("{TERMINAL}.format"),
             json!({"session_id": sc.sid, "block_id": sc.bid,
@@ -2511,6 +2529,7 @@ impl App {
                 continue;
             };
             if let Some(want) = self.wants.remove(&id) {
+                trace(&format!("reply {id}"));
                 self.acks.push(id);
                 self.helper_reply(id, want, &reply);
             }
@@ -2555,6 +2574,11 @@ impl App {
                 wb.error = None;
                 wb.vw = reply["vw"].as_f64().unwrap_or(0.0);
                 wb.vh = reply["vh"].as_f64().unwrap_or(0.0);
+                wb.y = reply["y"].as_f64().unwrap_or(0.0);
+                wb.full = reply["full"].as_f64().unwrap_or(0.0);
+                if wb.held.take().is_some() {
+                    wb.drawn = false;
+                }
                 wb.edit = reply["edit"].as_bool().unwrap_or(false);
                 let url = reply["url"].as_str().unwrap_or("").to_string();
                 if url != wb.url {
@@ -2575,15 +2599,23 @@ impl App {
                     return; // the same picture as before
                 };
                 wb.busy = true;
+                trace("fetch");
                 let (path, hash) = (path.to_string(), hash.to_string());
                 self.fetch(bid, path, hash);
             }
             Want::Act(bid) => {
+                // The answer to an act is the picture of what it did.
+                if error.is_none() && reply["hash"].is_string() {
+                    return self.helper_reply(id, Want::Shot(bid), reply);
+                }
                 if let Some(e) = error {
                     self.say(&format!("The page didn't take that: {e}"));
                 }
                 if let View::Win(wv) = &mut self.view {
                     if let Some(Pane { body: Body::Web(wb), .. }) = wv.panes.iter_mut().find(|p| p.block_id == bid) {
+                        wb.busy = false;
+                        wb.held = None;
+                        wb.drawn = false;
                         wb.next_shot = Instant::now();
                     }
                 }
@@ -2654,10 +2686,12 @@ impl App {
             return;
         };
         wb.busy = false;
+        trace(&format!("got {} bytes", f.buf.len()));
         let done = match failed {
             Some(e) => Err(e),
             None => wb.set_jpeg(&f.buf),
         };
+        trace("decoded");
         match done {
             Ok(()) => wb.hash = f.hash,
             Err(e) => {
@@ -2699,7 +2733,20 @@ impl App {
 
     /// Do something to a browser pane's page.
     fn web_act(&mut self, bid: &str, mut body: Value) {
+        trace(&format!("act {}", body["web"]));
         body["block"] = json!(bid);
+        // Ask for the picture of the result in the same breath: one trip to
+        // the Mac and back instead of two.
+        let zoom = self.web_zoom;
+        if let View::Win(wv) = &mut self.view {
+            let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+            if let Some(Pane { rect: Some(rect), body: Body::Web(wb), .. }) = wv.panes.iter_mut().find(|p| p.block_id == bid) {
+                let page = web::page_rect(inner(*rect, multi));
+                (body["w"], body["h"], body["last"], body["zoom"]) = (json!(page.w), json!(page.h), json!(wb.hash), json!(zoom));
+                wb.busy = true;
+                wb.next_shot = Instant::now() + Duration::from_secs(20);
+            }
+        }
         if let Err(e) = self.ask_helper(body, Want::Act(bid.to_string())) {
             self.say(&format!("Can't reach the page: {e}"));
         }
@@ -2805,6 +2852,7 @@ impl App {
         if self.scribe.as_ref().is_some_and(|sc| sc.bid == bid && !bid.is_empty()) {
             // The reader sets its title when it has something to say.
             if name == "title_changed" {
+                trace("title");
                 self.poll_scribe();
             } else if name == "child_exited" {
                 self.scribe = None;
@@ -2872,6 +2920,7 @@ impl App {
                         let mut hello = vec![0x01];
                         hello.extend_from_slice(&ticket);
                         data.send(Out::Binary(hello));
+                        trace("ticket");
                         self.fetches[i].req = None;
                         self.fetches[i].wire = Some(data);
                     }
@@ -2885,6 +2934,7 @@ impl App {
             if let Some(sc) = self.scribe.as_mut() {
                 if sc.writing.as_deref() == id && id.is_some() {
                     sc.writing = None;
+                    trace("written");
                     self.pump_helper();
                     return;
                 }
@@ -2898,10 +2948,14 @@ impl App {
                 }
                 if sc.polling.as_deref() == id && id.is_some() {
                     sc.polling = None;
+                    let stale = sc.stale;
                     match failed {
                         None => {
                             let screen = v["payload"]["content"].as_str().unwrap_or("").to_string();
                             self.scribe_screen(&screen);
+                            if stale {
+                                self.poll_scribe();
+                            }
                         }
                         Some(why) => self.scribe_lost(&why),
                     }
@@ -3014,6 +3068,7 @@ impl App {
             match msg {
                 In::Binary(b) if !self.fetches[i].welcomed => {
                     if b.first() == Some(&0x81) {
+                        trace("welcomed");
                         self.fetches[i].welcomed = true;
                     } else {
                         let f = self.fetches.remove(i);
@@ -3370,6 +3425,7 @@ impl App {
                     if redo || !wb.drawn {
                         let r = inner(rect, multi);
                         wb.draw(&mut self.canvas, &self.ui, r);
+                        trace("drawn");
                         self.dirty.add_rect(r);
                     }
                 }
@@ -3576,6 +3632,20 @@ impl App {
             out.push('\n');
         }
         out
+    }
+}
+
+/// Timings for finding slowness: written to /tmp/rexpaper.trace when the
+/// file `trace` is in the config folder.
+fn trace(what: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static ON: OnceLock<Option<Instant>> = OnceLock::new();
+    let Some(t0) = ON.get_or_init(|| (std::env::var("REXPAPER_TRACE").is_ok() || std::path::Path::new(&format!("{CONFIG_DIR}/trace")).exists()).then(Instant::now)) else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rexpaper.trace") {
+        let _ = writeln!(f, "{:8} {what}", t0.elapsed().as_millis());
     }
 }
 

@@ -277,6 +277,55 @@ def web(msg):
     op, block = msg.get("web"), msg.get("block", "")
     pane = {"id": block}
 
+    if op != "shot":
+        reply = web_act(op, pane, msg)
+        # A request that says how big the pane is wants the picture of what
+        # the act did as its answer.
+        if reply.get("error") or not msg.get("w"):
+            return reply
+    return web_shot(block, pane, msg)
+
+
+def web_shot(block, pane, msg):
+    """Take the picture of a pane's page, at the size the tablet shows it."""
+    tag = "".join(c for c in block[-8:] if c.isalnum())
+    png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
+    zoom = max(25, min(400, int(msg.get("zoom") or 100)))
+    w, h = int(msg.get("w") or 0), int(msg.get("h") or 0)
+    # Two tablet pixels to a CSS pixel at 100%: text is then about the
+    # size it is on paper.
+    want = (round(w * 50 / zoom), round(h * 50 / zoom))
+    sized = False
+    if min(want) >= 100:
+        sized = bool(rexweb("/size", dict(pane, width=want[0], height=want[1], hold=20)).get("sized"))
+        if sized and SIZES.get(block) != want:
+            time.sleep(0.4)  # the page lays itself out again
+        SIZES[block] = want if sized else None
+    state = rexweb("/eval", dict(pane, js=JS_STATE)).get("value") or {}
+    # Ask for the picture at the tablet's own width, so it isn't stretched.
+    shot = rexweb("/shot", dict(pane, path=png, width=w / 2) if sized else dict(pane, path=png))
+    if shot.get("error"):
+        return {"error": shot["error"]}
+    info = rexweb("/info", pane)
+    width = max(64, min(int(msg.get("w") or 1200), int(shot.get("width") or 1200)))
+    done = subprocess.run(["sips", "--resampleWidth", str(width), "-s", "format", "jpeg",
+                           "-s", "formatOptions", "50", png, "--out", jpg], capture_output=True)
+    if done.returncode != 0:
+        return {"error": "couldn't make the picture: " + done.stderr.decode(errors="replace")[:120]}
+    with open(jpg, "rb") as f:
+        digest = hashlib.sha1(f.read()).hexdigest()[:16]
+    out = {"hash": digest, "url": info.get("url", ""), "title": info.get("title", ""),
+           "loading": bool(info.get("loading")), "vw": state.get("vw", 0), "vh": state.get("vh", 0),
+           "y": state.get("y", 0), "full": state.get("full", 0), "edit": bool(state.get("edit"))}
+    if digest == msg.get("last"):
+        out["same"] = True
+    else:
+        out["path"] = jpg
+    return out
+
+
+def web_act(op, pane, msg):
+    """Do something to the page -> {"ok": 1} or {"error": ...}."""
     def settle(reply):
         # Give a click or a key that loads a page time to do so.
         if not reply.get("error"):
@@ -284,45 +333,13 @@ def web(msg):
             rexweb("/loaded", dict(pane, timeout=6), timeout=8)
         return {"error": reply["error"]} if reply.get("error") else {"ok": 1}
 
-    if op == "shot":
-        tag = "".join(c for c in block[-8:] if c.isalnum())
-        png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
-        zoom = max(25, min(400, int(msg.get("zoom") or 100)))
-        w, h = int(msg.get("w") or 0), int(msg.get("h") or 0)
-        # Two tablet pixels to a CSS pixel at 100%: text is then about the
-        # size it is on paper.
-        want = (round(w * 50 / zoom), round(h * 50 / zoom))
-        sized = False
-        if min(want) >= 100:
-            sized = bool(rexweb("/size", dict(pane, width=want[0], height=want[1], hold=20)).get("sized"))
-            if sized and SIZES.get(block) != want:
-                time.sleep(0.4)  # the page lays itself out again
-            SIZES[block] = want if sized else None
-        state = rexweb("/eval", dict(pane, js=JS_STATE)).get("value") or {}
-        # Ask for the picture at the tablet's own width, so it isn't stretched.
-        shot = rexweb("/shot", dict(pane, path=png, width=w / 2) if sized else dict(pane, path=png))
-        if shot.get("error"):
-            return {"error": shot["error"]}
-        info = rexweb("/info", pane)
-        width = max(64, min(int(msg.get("w") or 1200), int(shot.get("width") or 1200)))
-        done = subprocess.run(["sips", "--resampleWidth", str(width), "-s", "format", "jpeg",
-                               "-s", "formatOptions", "70", png, "--out", jpg], capture_output=True)
-        if done.returncode != 0:
-            return {"error": "couldn't make the picture: " + done.stderr.decode(errors="replace")[:120]}
-        with open(jpg, "rb") as f:
-            digest = hashlib.sha1(f.read()).hexdigest()[:16]
-        out = {"hash": digest, "url": info.get("url", ""), "title": info.get("title", ""),
-               "loading": bool(info.get("loading")), "vw": state.get("vw", 0), "vh": state.get("vh", 0),
-               "y": state.get("y", 0), "full": state.get("full", 0), "edit": bool(state.get("edit"))}
-        if digest == msg.get("last"):
-            out["same"] = True
-        else:
-            out["path"] = jpg
-        return out
     if op == "tap":
         return settle(rexweb("/eval", dict(pane, js=JS_TAP % (float(msg.get("x", 0)), float(msg.get("y", 0))))))
     if op == "scroll":
-        return settle(rexweb("/eval", dict(pane, js=f"scrollBy(0, {float(msg.get('dy', 0))})")))
+        # Scrolling loads nothing: no need to wait for it.
+        reply = rexweb("/eval", dict(pane, js=f"scrollBy({{top: {float(msg.get('dy', 0))}, behavior: 'instant'}})"))
+        time.sleep(0.03)
+        return {"error": reply["error"]} if reply.get("error") else {"ok": 1}
     if op == "text":
         return settle(rexweb("/eval", dict(pane, js=JS_TEXT % json.dumps(str(msg.get("text", ""))))))
     if op == "key":
@@ -390,7 +407,7 @@ def main():
         out = "\x1b[3J\x1b[2J\x1b[H" if term else ""
         for obj in list(unread.values())[-1:] if not term else unread.values():
             out += "@@scribe " + json.dumps(obj) + "@@\r\n"
-        if term:
+        if term and title:
             out += f"\x1b]2;scribe {title}\x07"
         sys.stdout.write(out)
         sys.stdout.flush()
@@ -458,7 +475,9 @@ def main():
             for a in msg.get("acks") or []:
                 unread.pop(a, None)
             if msg.get("acks"):
-                show("read")
+                # No new title: it would send the client to read a screen
+                # that has nothing new, just as the real answer is due.
+                show(None)
         if "web" in msg:
             web_queue.put((rid, msg))
             continue
