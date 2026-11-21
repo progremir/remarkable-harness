@@ -1,5 +1,5 @@
 diff --git a/Sources/RexWeb.swift b/Sources/RexWeb.swift
-index 74497c2..605e19f 100644
+index 74497c2..f57ab27 100644
 --- a/Sources/RexWeb.swift
 +++ b/Sources/RexWeb.swift
 @@ -117,7 +117,9 @@ enum RexChrome {
@@ -13,7 +13,7 @@ index 74497c2..605e19f 100644
          if value("sidebarPosition") as? String == "right" { i.right = w; i.floatRight = w } else { i.left = w; i.floatLeft = w; i.floatTop = 0 }
        }
      }
-@@ -223,6 +225,11 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
+@@ -223,6 +225,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
    var lastLabel = ""
    var visible = false
    var lastFrame = NSRect.zero
@@ -22,10 +22,15 @@ index 74497c2..605e19f 100644
 +  // and scaled to fit here, as a terminal sized by another device is.
 +  var claim: NSSize?
 +  var claimUntil = Date.distantPast
++  // Local addition: the pane's own program draws the page inside its
++  // terminal, with the terminal's image protocol. No window is ever put
++  // over Rex for such a pane; `base` is the page size its terminal has.
++  var inline = false
++  var base: NSSize?
    var layoutKey = ""
    var settleUntil = Date.distantPast
    var lastActive = Date()
-@@ -250,7 +257,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
+@@ -250,7 +262,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
      window.hasShadow = false
      window.backgroundColor = .clear
      window.isOpaque = false
@@ -34,7 +39,7 @@ index 74497c2..605e19f 100644
  
      let root = NSView()
      root.wantsLayer = true
-@@ -315,7 +322,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
+@@ -315,7 +327,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
      forwardButton.frame = NSRect(x: 30, y: 4, width: 24, height: 22)
      reloadButton.frame = NSRect(x: 54, y: 4, width: 24, height: 22)
      urlField.frame = NSRect(x: 84, y: 4, width: max(40, b.width - 92), height: 22)
@@ -52,18 +57,30 @@ index 74497c2..605e19f 100644
    }
  
    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-@@ -647,6 +663,10 @@ final class Tracker {
+@@ -647,6 +668,14 @@ final class Tracker {
    }
  
    func refreshAll() {
 +    for p in App.shared.panels.values where p.claim != nil && Date() > p.claimUntil {
 +      p.claim = nil
++      if p.inline, let b = p.base {
++        p.window.setContentSize(NSSize(width: b.width, height: b.height + Double(Panel.barHeight)))
++        p.lastFrame = .zero
++      }
 +      p.layout()
 +    }
      for s in Set(App.shared.panels.values.map(\.session)) { refresh(s) }
    }
  
-@@ -821,17 +841,29 @@ final class Tracker {
+@@ -759,6 +788,7 @@ final class Tracker {
+     let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+ 
+     for p in panels {
++      if p.inline { hide(p); continue }
+       guard displayed[p.id] == true, let v = views[p.session], let place = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
+       let ins = insets
+       let frac = place.rect
+@@ -821,17 +851,29 @@ final class Tracker {
    func window(for p: Panel, _ place: (rect: CGRect, floating: Bool), _ v: [String: Any], _ rexWins: [RexWindow], _ primaryHeight: CGFloat) -> RexWindow? {
      let label = v["label"] as? String ?? ""
      if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
@@ -99,7 +116,38 @@ index 74497c2..605e19f 100644
    }
  
    static func body(_ frac: CGRect, floating: Bool, in b: CGRect, _ ins: Insets) -> (body: CGRect, radius: Double) {
-@@ -1313,6 +1345,20 @@ final class App: NSObject, NSApplicationDelegate {
+@@ -1177,6 +1219,7 @@ final class App: NSObject, NSApplicationDelegate {
+ 
+   func focus(_ p: Panel) {
+     p.lastActive = Date()
++    if p.inline { return }
+     guard p.visible else { p.pendingFocus = true; return }
+     NSApp.activate(ignoringOtherApps: true)
+     p.window.makeKey()
+@@ -1232,8 +1275,12 @@ final class App: NSObject, NSApplicationDelegate {
+       return ok(["panels": panels.values.sorted { $0.lastActive > $1.lastActive }.map { $0.info() }])
+     case "/register":
+       guard let id = input["id"] as? String, let session = input["session"] as? String else { return fail("id and session required") }
+-      if let p = panels[id] { return ok(p.info()) }
++      if let p = panels[id] {
++        if let i = input["inline"] as? Bool { p.inline = i }
++        return ok(p.info())
++      }
+       let p = Panel(id: id, session: session)
++      p.inline = input["inline"] as? Bool == true
+       panels[id] = p
+       tracker.refresh(session)
+       if let url = input["url"] as? String, !url.isEmpty { p.load(url) }
+@@ -1300,7 +1347,7 @@ final class App: NSObject, NSApplicationDelegate {
+     }
+     if route != "/info" { p.lastActive = Date() }
+ 
+-    if ["/click", "/type", "/press"].contains(route), !p.visible {
++    if ["/click", "/type", "/press"].contains(route), !p.visible, !p.inline {
+       func retry(_ left: Int) {
+         if p.visible { return handle(path: path, input: input, reply: reply) }
+         if left == 0 {
+@@ -1313,6 +1360,31 @@ final class App: NSObject, NSApplicationDelegate {
      switch route {
      case "/info":
        ok(p.info())
@@ -109,6 +157,17 @@ index 74497c2..605e19f 100644
 +      // lapses unless it is renewed, and the pane then follows Rex again.
 +      let w = (input["width"] as? NSNumber)?.doubleValue ?? 0, h = (input["height"] as? NSNumber)?.doubleValue ?? 0
 +      guard w >= 100, h >= 100, w <= 4000, h <= 4000 else { return fail("width and height must be 100 to 4000") }
++      if input["base"] as? Bool == true {
++        // The size of the pane's own terminal: used while no device claims one.
++        p.base = NSSize(width: w, height: h)
++        if p.claim == nil, !p.visible {
++          let size = NSSize(width: w, height: h + Double(Panel.barHeight))
++          if p.window.frame.size != size { p.window.setContentSize(size); p.lastFrame = .zero }
++          p.layout()
++        }
++        // `scale`: screen pixels to a point, to turn a terminal's pixel size into points.
++        return ok(["sized": true, "claimed": p.claim != nil, "scale": Double(NSScreen.main?.backingScaleFactor ?? 2)])
++      }
 +      p.claim = NSSize(width: w, height: h)
 +      p.claimUntil = Date().addingTimeInterval((input["hold"] as? NSNumber)?.doubleValue ?? 20)
 +      if !p.visible {
@@ -120,7 +179,7 @@ index 74497c2..605e19f 100644
      case "/loaded":
        var replied = false
        let timeout = (input["timeout"] as? NSNumber)?.doubleValue ?? 30
-@@ -1383,7 +1429,13 @@ final class App: NSObject, NSApplicationDelegate {
+@@ -1383,7 +1455,13 @@ final class App: NSObject, NSApplicationDelegate {
      case "/shot":
        let path = (input["path"] as? String) ?? NSTemporaryDirectory() + "rexweb-\(p.id.suffix(6))-\(Int(Date().timeIntervalSince1970)).png"
        guard path.lowercased().hasSuffix(".png") else { return fail("screenshot path must end in .png") }
@@ -135,3 +194,20 @@ index 74497c2..605e19f 100644
          guard let img, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
                let png = rep.representation(using: .png, properties: [:]) else { return fail(err?.localizedDescription ?? "snapshot failed") }
          do { try png.write(to: URL(fileURLWithPath: path)); ok(["path": path, "width": rep.pixelsWide, "height": rep.pixelsHigh]) }
+diff --git a/bin/rexweb-pane b/bin/rexweb-pane
+index 7f317b8..583db3b 100755
+--- a/bin/rexweb-pane
++++ b/bin/rexweb-pane
+@@ -4,6 +4,12 @@
+ # the panel if RexWeb restarts, and closes the panel when the pane goes away.
+ set -u
+ PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
++# Local addition: with a program at ~/.rexweb/pane (or $REXWEB_INLINE), that
++# program holds the pane and draws the page inside the terminal itself, so
++# no window is floated over Rex. See rexpaper/mac/webpane.py in
++# remarkable-harness.
++inline="${REXWEB_INLINE:-$HOME/.rexweb/pane}"
++[ -x "$inline" ] && exec "$inline" "$@"
+ url="${1:-}"
+ cfg="$HOME/.rexweb/config.json"
+ port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
