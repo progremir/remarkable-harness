@@ -78,8 +78,11 @@ impl Pen {
                     (1, 0x14a) => self.touching = value != 0, // BTN_TOUCH
                     (1, 0x141) => {
                         // BTN_TOOL_RUBBER
+                        // The eraser coming near is not reported: the
+                        // app gets ready for ink when the pen nears, by
+                        // changing how the screen is driven, and each
+                        // change repaints the whole screen.
                         self.rubber = value != 0;
-                        self.near = value != 0;
                     }
                     (1, 0x140) => self.near = value != 0, // BTN_TOOL_PEN
                     (0, 0) => {

@@ -2223,8 +2223,14 @@ impl App {
                 if writes && eraser {
                     // What the eraser rubs out is drawn away in the clean
                     // mode, so it leaves no ghost. Speed doesn't matter here.
-                    self.clean_until = None;
-                    self.set_mode(MODE_CLEAN);
+                    // Changing the mode makes AppLoad repaint the whole
+                    // screen, which in the clean mode is a full flash: so
+                    // only when there is ink over a terminal to rub out.
+                    // A note on a page goes in the mode the screen is in.
+                    if web.is_none() && !(self.ink.strokes.is_empty() && self.ink.sent.is_empty()) {
+                        self.clean_until = None;
+                        self.set_mode(MODE_CLEAN);
+                    }
                     self.ink.erasing = Some((p, p.0, p.0, 0, false));
                     self.erase(p);
                 } else if writes {
@@ -2277,7 +2283,9 @@ impl App {
                     let e = tap(qtfb::INPUT_PEN_RELEASE, p);
                     self.touch(e);
                 } else if let Some((_, _, _, deleted, inked)) = self.ink.erasing.take() {
-                    self.clean_until = Some(Instant::now() + CLEAN_FOR);
+                    if self.mode == MODE_CLEAN {
+                        self.clean_until = Some(Instant::now() + CLEAN_FOR);
+                    }
                     // A dab with the eraser deletes one character.
                     if deleted == 0 && !inked && self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
                         self.type_bytes(vec![0x7f]);
