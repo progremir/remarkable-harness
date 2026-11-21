@@ -9,6 +9,7 @@ small file and written with one `cat`, so the kernel always receives whole
 24-byte events: a write that splits an event is refused.
 """
 import base64
+import os
 import struct
 import subprocess
 
@@ -43,7 +44,7 @@ def send(device, frames, pause_s):
         if i < len(frames) - 1:
             lines.append("usleep %d" % int(pause_s * 1e6))
     lines.append("rm -rf $D")
-    subprocess.run(["ssh", "rm", "sh -s"], input="\n".join(lines).encode(), check=True)
+    subprocess.run(["ssh", os.environ.get("RM_HOST", "rm"), "sh -s"], input="\n".join(lines).encode(), check=True)
 
 
 # --- finger (multitouch protocol B) ---

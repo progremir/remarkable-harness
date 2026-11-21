@@ -545,6 +545,9 @@ struct Ink {
     /// A slow refresh that clears ghosts is due, with the next full one.
     /// Only **Refresh screen** asks for it.
     deghost_now: bool,
+    /// The stroke being drawn is a note on this browser pane's page: it
+    /// stays as ink and is not read.
+    note: Option<String>,
 }
 
 /// The terminal block on the server's machine that reads handwriting.
@@ -599,6 +602,8 @@ struct Retry {
 }
 
 struct App {
+    /// Pen notes left on web pages, by `web::note_key` of the address.
+    notes: HashMap<String, Vec<web::Note>>,
     screen: Screen,
     canvas: Vec<u8>,
     rot: Rot,
@@ -2203,9 +2208,18 @@ impl App {
         match ev {
             PenEv::Down(px, py, eraser) => {
                 let p = at(px, py);
-                let writes = self.overlay.is_none()
+                let mut writes = self.overlay.is_none()
                     && matches!(&self.view, View::Win(wv) if !wv.select)
                     && (p.1 as usize) < g.keys_y;
+                // On a browser pane the pen presses the bar's buttons and
+                // leaves notes on the page.
+                let web = if writes { self.web_under(p) } else { None };
+                self.ink.note = None;
+                match &web {
+                    Some((_, area)) if !web::page_rect(*area).has(p.0, p.1) => writes = false,
+                    Some((bid, _)) if !eraser => self.ink.note = Some(bid.clone()),
+                    _ => {}
+                }
                 if writes && eraser {
                     // What the eraser rubs out is drawn away in the clean
                     // mode, so it leaves no ghost. Speed doesn't matter here.
@@ -2271,10 +2285,87 @@ impl App {
                     self.ink.last_up = Some(Instant::now());
                 } else if self.ink.down {
                     self.ink.down = false;
-                    self.ink.last_up = Some(Instant::now());
+                    if let Some(bid) = self.ink.note.take() {
+                        self.keep_note(&bid);
+                    } else {
+                        self.ink.last_up = Some(Instant::now());
+                    }
                 }
             }
         }
+    }
+
+    /// The browser pane under a point of the canvas: its block and area.
+    fn web_under(&self, p: (i32, i32)) -> Option<(String, Rect)> {
+        let View::Win(wv) = &self.view else {
+            return None;
+        };
+        let multi = wv.panes.iter().filter(|p| p.rect.is_some()).count() > 1;
+        wv.panes.iter().find_map(|pane| match (pane.rect, &pane.body) {
+            (Some(rect), Body::Web(_)) if inner(rect, multi).has(p.0, p.1) => Some((pane.block_id.clone(), inner(rect, multi))),
+            _ => None,
+        })
+    }
+
+    /// The stroke just finished was drawn on a page: keep it as a note
+    /// there, at the place on the page it was drawn.
+    fn keep_note(&mut self, bid: &str) {
+        let Some(stroke) = self.ink.strokes.pop() else {
+            return;
+        };
+        let Some((_, area)) = self.web_under(stroke[0]) else {
+            return self.unink(&[stroke]);
+        };
+        let page = web::page_rect(area);
+        let kept = match self.web_pane(bid) {
+            Some((_, wb)) if !wb.url.is_empty() => {
+                let pts: Option<Vec<(f64, f64)>> = stroke.iter().map(|p| wb.to_page(p.0, p.1, page)).collect();
+                pts.map(|pts| (web::note_key(&wb.url).to_string(), web::Note { vw: wb.vw, pts }))
+            }
+            _ => None,
+        };
+        match kept {
+            Some((key, note)) => {
+                self.notes.entry(key).or_default().push(note);
+                save_notes(&self.notes);
+            }
+            // No page to put it on yet.
+            None => self.unink(&[stroke]),
+        }
+    }
+
+    /// Rub out the notes the eraser's path from `last` to `p` comes near.
+    /// True when the eraser is on a browser pane's page.
+    fn erase_notes(&mut self, last: (i32, i32), p: (i32, i32)) -> bool {
+        let Some((bid, area)) = self.web_under(p) else {
+            return false;
+        };
+        let page = web::page_rect(area);
+        const REACH: i32 = 30;
+        let n = ((p.0 - last.0).abs().max((p.1 - last.1).abs()) / 10).max(1);
+        let path: Vec<(i32, i32)> =
+            (0..=n).map(|k| (last.0 + (p.0 - last.0) * k / n, last.1 + (p.1 - last.1) * k / n)).collect();
+        let View::Win(wv) = &mut self.view else {
+            return true;
+        };
+        let Some(Pane { body: Body::Web(wb), .. }) = wv.panes.iter_mut().find(|pane| pane.block_id == bid) else {
+            return true;
+        };
+        let Some(notes) = self.notes.get_mut(web::note_key(&wb.url)) else {
+            return true;
+        };
+        let before = notes.len();
+        notes.retain(|note| {
+            !note.pts.iter().any(|&q| {
+                let q = wb.to_canvas(note, q, page);
+                path.iter().any(|e| (q.0 - e.0).pow(2) + (q.1 - e.1).pow(2) <= REACH * REACH)
+            })
+        });
+        if notes.len() != before {
+            wb.drawn = false;
+            save_notes(&self.notes);
+        }
+        true
     }
 
     /// The eraser moved to `p`. While there are scribbles it rubs them
@@ -2286,6 +2377,11 @@ impl App {
         };
         let (lo, hi) = (lo.min(p.0), hi.max(p.0));
         self.ink.erasing = Some((p, lo, hi, deleted, inked));
+        if self.erase_notes(last, p) {
+            // On a page the eraser only rubs out notes: it deletes no text.
+            self.ink.erasing = Some((p, lo, hi, deleted, true));
+            return;
+        }
         if self.ink.strokes.is_empty() && self.ink.sent.is_empty() {
             if inked {
                 return; // this rub was for ink, and has just finished it off
@@ -3424,7 +3520,8 @@ impl App {
                 Body::Web(wb) => {
                     if redo || !wb.drawn {
                         let r = inner(rect, multi);
-                        wb.draw(&mut self.canvas, &self.ui, r);
+                        let notes = self.notes.get(web::note_key(&wb.url)).map_or(&[][..], |n| &n[..]);
+                        wb.draw(&mut self.canvas, &self.ui, r, notes);
                         trace("drawn");
                         self.dirty.add_rect(r);
                     }
@@ -3649,6 +3746,49 @@ fn trace(what: &str) {
     }
 }
 
+/// Where the notes left on web pages are kept.
+fn notes_path() -> String {
+    std::env::var("REXPAPER_NOTES").unwrap_or_else(|_| format!("{CONFIG_DIR}/webnotes.json"))
+}
+
+fn load_notes() -> HashMap<String, Vec<web::Note>> {
+    let Some(all) = std::fs::read_to_string(notes_path()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+        return HashMap::new();
+    };
+    let note = |n: &Value| {
+        let flat: Vec<f64> = n["p"].as_array()?.iter().filter_map(Value::as_f64).collect();
+        Some(web::Note { vw: n["vw"].as_f64()?, pts: flat.chunks_exact(2).map(|c| (c[0], c[1])).collect() })
+    };
+    all.as_object()
+        .map(|pages| {
+            pages
+                .iter()
+                .map(|(url, notes)| (url.clone(), notes.as_array().map(|a| a.iter().filter_map(note).collect()).unwrap_or_default()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_notes(notes: &HashMap<String, Vec<web::Note>>) {
+    let round = |v: f64| (v * 10.0).round() / 10.0;
+    let pages: serde_json::Map<String, Value> = notes
+        .iter()
+        .filter(|(_, n)| !n.is_empty())
+        .map(|(url, n)| {
+            let list: Vec<Value> = n
+                .iter()
+                .map(|note| json!({"vw": note.vw, "p": note.pts.iter().flat_map(|p| [round(p.0), round(p.1)]).collect::<Vec<f64>>()}))
+                .collect();
+            (url.clone(), Value::Array(list))
+        })
+        .collect();
+    // Written beside and moved over, so a crash can't leave half a file.
+    let (path, tmp) = (notes_path(), format!("{}.new", notes_path()));
+    if std::fs::write(&tmp, Value::Object(pages).to_string()).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("rexpaper: couldn't save the page notes to {path}");
+    }
+}
+
 fn setting(name: &str) -> Option<String> {
     std::env::var(format!("REXPAPER_{}", name.to_uppercase()))
         .ok()
@@ -3731,6 +3871,7 @@ fn run() -> std::io::Result<()> {
         rot: Rot(0),
         fonts,
         font_ix,
+        notes: load_notes(),
         web_zoom: setting("webzoom").and_then(|z| z.parse().ok()).unwrap_or(100).clamp(50, 300),
         ui: parse(FONTS[1].1)?,
         big: parse(FONTS[2].1)?,

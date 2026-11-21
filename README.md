@@ -126,7 +126,10 @@ Open **Rex** in AppLoad. It lists every session on the server and the tabs in ea
   - Claude reads the ink on the Mac, through its Claude Code login, so `claude` must be installed there. It takes 3 to 5 seconds. `SCRIBE_MODEL` in the Mac's shell profile picks the model (default `sonnet`).
 - **Browser panes:** a [rexweb](https://github.com/acoyfellow/rexweb) pane shows on the tablet as a picture of its page, kept up to date.
   - Tap to click. Drag to scroll; the page moves when the finger lifts.
-  - With the pane in focus, the keyboard, the key row and handwriting type into the page's focused field.
+  - With the pane in focus, the keyboard and the key row type into the page's focused field. So does handwriting written over a terminal beside it.
+  - The pen on a page leaves notes, not text: the ink stays where it was drawn and is never read. A note belongs to the page's address and to the place on the page, so it scrolls with the page and is there when you come back. The pen's eraser rubs notes out, a stroke at a time. The notes are kept on the tablet in `/home/root/.config/rexpaper/webnotes.json`; the Mac doesn't show them.
+  - A note keeps its place as long as the page is laid out the same. After **A-** / **A+**, or in a pane of another width, the text wraps differently and a note may sit beside what it was drawn on.
+  - The pen also presses the bar's buttons. To click on the page, use a finger.
   - A bar above the page has back, forward and reload buttons and the address. Tap the address to go somewhere else.
   - A page is laid out for the tablet pane's own size while the tablet shows it, as a terminal is resized for the device looking at it. Rex on the Mac then shows the same page scaled to fit its pane. About 20 seconds after the tablet leaves the tab, the Mac gets its own size back.
   - **A-** and **A+** in the bar change the text size in steps of 25%, by laying the page out for a smaller or bigger screen. The choice is kept in `/home/root/.config/rexpaper/webzoom`.

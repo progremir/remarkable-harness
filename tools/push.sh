@@ -13,4 +13,4 @@ SRC=$(cd "$1" && pwd)
 NAME=$(basename "$SRC")
 DEST=$2
 COPYFILE_DISABLE=1 tar -C "$(dirname "$SRC")" --uid 0 --gid 0 --no-xattrs -cf - "$NAME" \
-  | ssh rm "mkdir -p '$DEST' && tar -C '$DEST' -xf - && ls -ldn '$DEST/$NAME' /home/root"
+  | ssh "${RM_HOST:-rm}" "mkdir -p '$DEST' && tar -C '$DEST' -xf - && ls -ldn '$DEST/$NAME' /home/root"

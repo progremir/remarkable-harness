@@ -53,6 +53,22 @@ pub fn bar_hit(x: i32, y: i32, r: Rect) -> Option<BarHit> {
     bar_parts(r).iter().find(|(_, b)| b.has(x, y)).map(|(hit, _)| *hit)
 }
 
+/// A pen stroke left on a page as a note. Its points are in the page's
+/// CSS pixels, from the top of the whole page, so it stays with what it
+/// was drawn on when the page scrolls. `vw` is how wide the page was laid
+/// out then: at another width the points are scaled to match.
+#[derive(Clone)]
+pub struct Note {
+    pub vw: f64,
+    pub pts: Vec<(f64, f64)>,
+}
+
+/// The name a page's notes are kept under: its address without the part
+/// after `#`, which only says where on the page to look.
+pub fn note_key(url: &str) -> &str {
+    url.split('#').next().unwrap_or(url)
+}
+
 pub struct WebView {
     /// The page as last seen: RGB565, `iw` x `ih`.
     img: Vec<u8>,
@@ -173,7 +189,52 @@ impl WebView {
         }
     }
 
-    pub fn draw(&mut self, fb: &mut [u8], font: &Psf2Font, r: Rect) {
+    /// Where a point of the canvas is on the whole page, in CSS pixels.
+    pub fn to_page(&self, x: i32, y: i32, r: Rect) -> Option<(f64, f64)> {
+        if self.iw == 0 || self.vw <= 0.0 {
+            return None;
+        }
+        let k = self.vw / self.iw as f64;
+        Some(((x - r.x as i32) as f64 * k, (y - r.y as i32) as f64 * k + self.y))
+    }
+
+    /// Where a note's point is on the canvas now. It may be off the pane.
+    pub fn to_canvas(&self, note: &Note, p: (f64, f64), r: Rect) -> (i32, i32) {
+        let fit = if note.vw > 0.0 { self.vw / note.vw } else { 1.0 };
+        let k = self.iw as f64 / self.vw.max(1.0);
+        (r.x as i32 + (p.0 * fit * k).round() as i32, r.y as i32 + ((p.1 * fit - self.y) * k).round() as i32)
+    }
+
+    /// Draw the notes left on this page over its picture.
+    fn draw_notes(&self, fb: &mut [u8], notes: &[Note], r: Rect) {
+        if self.iw == 0 || self.vw <= 0.0 {
+            return;
+        }
+        let (x0, y0, x1, y1) = (r.x as i32 + 2, r.y as i32 + 2, (r.x + r.w) as i32 - 3, (r.y + r.h) as i32 - 3);
+        let mut dot = |x: i32, y: i32| {
+            if x >= x0 && y >= y0 && x < x1 && y < y1 {
+                render::fill_rect(fb, x as usize - 1, y as usize - 1, 4, 4, BLACK);
+            }
+        };
+        for note in notes {
+            let pts: Vec<(i32, i32)> = note.pts.iter().map(|&p| self.to_canvas(note, p, r)).collect();
+            if pts.iter().all(|p| p.1 < y0 - 4) || pts.iter().all(|p| p.1 > y1 + 4) {
+                continue;
+            }
+            if let [one] = pts[..] {
+                dot(one.0, one.1);
+            }
+            for w in pts.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let n = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+                for k in 0..=n {
+                    dot(a.0 + (b.0 - a.0) * k / n, a.1 + (b.1 - a.1) * k / n);
+                }
+            }
+        }
+    }
+
+    pub fn draw(&mut self, fb: &mut [u8], font: &Psf2Font, r: Rect, notes: &[Note]) {
         self.drawn = true;
         render::fill_rect(fb, r.x, r.y, r.w, r.h, WHITE);
         for (hit, b) in bar_parts(r) {
@@ -209,5 +270,6 @@ impl WebView {
             let at = ((r.y + row) * cw + r.x) * 2;
             fb[at..at + w * 2].copy_from_slice(src);
         }
+        self.draw_notes(fb, notes, r);
     }
 }

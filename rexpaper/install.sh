@@ -15,12 +15,12 @@ STAGE=$(mktemp -d)/rexpaper
 mkdir -p "$STAGE"
 install -m 755 target/aarch64-unknown-linux-gnu/release/rexpaper run.sh "$STAGE/"
 install -m 644 external.manifest.json icon.png LICENSE.paperterm fonts/LICENSE.spleen "$STAGE/"
-ssh rm 'killall rexpaper 2>/dev/null; true'
+ssh "${RM_HOST:-rm}" 'killall rexpaper 2>/dev/null; true'
 ../tools/push.sh "$STAGE" /home/root/xovi/exthome/appload
 rm -rf "$(dirname "$STAGE")"
 # Where the helper is on this Mac: the client starts it there, through Rex.
 # It reads handwriting and takes pictures of rexweb's browser panes.
-ssh rm "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$PWD/mac/helper.py' > /home/root/.config/rexpaper/helper && rm -f /home/root/.config/rexpaper/scribe"
+ssh "${RM_HOST:-rm}" "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$PWD/mac/helper.py' > /home/root/.config/rexpaper/helper && rm -f /home/root/.config/rexpaper/scribe"
 if [ -n "$1" ]; then
-  ssh rm "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$1' > /home/root/.config/rexpaper/server && ls -ldn /home/root"
+  ssh "${RM_HOST:-rm}" "mkdir -p /home/root/.config/rexpaper && printf '%s\n' '$1' > /home/root/.config/rexpaper/server && ls -ldn /home/root"
 fi
