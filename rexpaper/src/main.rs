@@ -2354,16 +2354,19 @@ impl App {
         let Some(notes) = self.notes.get_mut(web::note_key(&wb.url)) else {
             return true;
         };
-        let before = notes.len();
+        // Where the notes that go were on the canvas: only that is redrawn.
+        let mut gone: Vec<Vec<(i32, i32)>> = Vec::new();
         notes.retain(|note| {
-            !note.pts.iter().any(|&q| {
-                let q = wb.to_canvas(note, q, page);
-                path.iter().any(|e| (q.0 - e.0).pow(2) + (q.1 - e.1).pow(2) <= REACH * REACH)
-            })
+            let pts: Vec<(i32, i32)> = note.pts.iter().map(|&q| wb.to_canvas(note, q, page)).collect();
+            let hit = pts.iter().any(|q| path.iter().any(|e| (q.0 - e.0).pow(2) + (q.1 - e.1).pow(2) <= REACH * REACH));
+            if hit {
+                gone.push(pts);
+            }
+            !hit
         });
-        if notes.len() != before {
-            wb.drawn = false;
+        if !gone.is_empty() {
             save_notes(&self.notes);
+            self.unink(&gone);
         }
         true
     }
@@ -3425,7 +3428,10 @@ impl App {
             wv.chrome.clear();
             render::fill_rect(&mut self.canvas, 0, 0, g.lw, g.lh, WHITE);
         } else if let Some(r) = repair {
-            wv.chrome.clear();
+            // The key row is drawn again only if the repair reaches it.
+            if r.y + r.h > g.keys_y {
+                wv.chrome.clear();
+            }
             render::fill_rect(&mut self.canvas, r.x, r.y, r.w, r.h, WHITE);
         }
         let redo = full || repair.is_some();
@@ -3441,8 +3447,11 @@ impl App {
                     render::fill_rect(&mut self.canvas, rect.x, rect.y + rect.h - 3, rect.w, 3, BLACK);
                 }
                 let key = format!("{}{}", if i == focus { '*' } else { ' ' }, pane.title);
-                if redo || key != pane.title_drawn {
-                    let strip = Rect::new(rect.x, rect.y, rect.w.saturating_sub(3), TITLE_H);
+                let strip = Rect::new(rect.x, rect.y, rect.w.saturating_sub(3), TITLE_H);
+                let wiped = repair.is_some_and(|r| {
+                    r.x < strip.x + strip.w && strip.x < r.x + r.w && r.y < strip.y + strip.h && strip.y < r.y + r.h
+                });
+                if full || wiped || key != pane.title_drawn {
                     ui::line(&mut self.canvas, &self.ui, strip, &pane.title, i == focus);
                     self.dirty.add_rect(strip);
                     pane.title_drawn = key;
@@ -3520,10 +3529,23 @@ impl App {
                 Body::Web(wb) => {
                     if redo || !wb.drawn {
                         let r = inner(rect, multi);
+                        // A repair, such as of a rubbed-out note, sends only
+                        // its own part of the pane to the screen: sending
+                        // the whole page would flash all of it.
+                        let part = match repair {
+                            Some(rep) if wb.drawn && !full => {
+                                let (x0, y0) = (rep.x.max(r.x), rep.y.max(r.y));
+                                let (x1, y1) = ((rep.x + rep.w).min(r.x + r.w), (rep.y + rep.h).min(r.y + r.h));
+                                (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+                            }
+                            _ => Some(r),
+                        };
                         let notes = self.notes.get(web::note_key(&wb.url)).map_or(&[][..], |n| &n[..]);
                         wb.draw(&mut self.canvas, &self.ui, r, notes);
                         trace("drawn");
-                        self.dirty.add_rect(r);
+                        if let Some(part) = part {
+                            self.dirty.add_rect(part);
+                        }
                     }
                 }
             }
