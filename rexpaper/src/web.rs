@@ -13,6 +13,9 @@ use crate::ui::{self, Rect};
 pub const LABEL: &str = "browser";
 /// What the terminal under a rexweb pane shows: "rexweb · " and the address.
 pub const SCREEN: &str = "rexweb \u{b7}";
+/// What a kb pane (https://github.com/graiz/kittybrowser) shows first: its
+/// back, forward and reload buttons.
+pub const SCREEN_KB: &str = "\u{2190}  \u{2192}  \u{21bb}";
 
 /// Height of the bar above the page: back, forward, reload and the address.
 pub const BAR_H: usize = 60;

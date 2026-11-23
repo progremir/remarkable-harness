@@ -272,10 +272,183 @@ def find_rexweb():
     return shutil.which("rexweb") or os.path.expanduser("~/.local/bin/rexweb")
 
 
+# ---- kb (KittyBrowser, https://github.com/graiz/kittybrowser) panes. kb draws
+# the page inside the terminal pane and answers `kb ctl` from outside it.
+
+KB_PANES = {}     # block ID -> kb's id for the browser in that pane
+KB_LISTED = 0.0   # when `kb list` was last read
+KB_USED = {}      # block ID -> when the tablet last asked about it
+KB_HOLD = 20      # seconds a pane keeps the tablet's size after its last request
+
+
+def find_kb():
+    return shutil.which("kb") or os.path.expanduser("~/.local/bin/kb")
+
+
+def kb_id(block):
+    """kb's id for the browser running in a pane, or None when the pane isn't a kb."""
+    global KB_LISTED
+    if block not in KB_PANES and time.time() - KB_LISTED > 3:
+        KB_LISTED = time.time()
+        KB_PANES.clear()
+        try:
+            listed = subprocess.run([find_kb(), "list"], capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            listed = ""
+        for line in listed.splitlines():
+            cols = line.split("\t")
+            if len(cols) >= 4 and cols[2].startswith("block:"):
+                KB_PANES[cols[2]] = cols[3].strip()
+    return KB_PANES.get(block)
+
+
+def kb(block, *args, timeout=20):
+    """Run one `kb ctl` command on a pane's browser -> (worked, what it printed)."""
+    try:
+        done = subprocess.run([find_kb(), "ctl", "-i", KB_PANES.get(block, ""), *args],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "kb didn't answer"
+    if done.returncode != 0:
+        KB_PANES.pop(block, None)  # it may have quit: look again next time
+        return False, (done.stderr.strip() or "kb ctl failed")[:200]
+    return True, done.stdout.strip()
+
+
+def kb_eval(block, js):
+    ok, out = kb(block, "eval", js)
+    if not ok:
+        return {"error": out}
+    try:
+        return {"value": json.loads(out)}
+    except ValueError:
+        return {"value": out}
+
+
+def kb_release():
+    """Give a pane back its own size once the tablet has stopped looking at it."""
+    while True:
+        time.sleep(5)
+        for block, used in list(KB_USED.items()):
+            if time.time() - used > KB_HOLD:
+                KB_USED.pop(block, None)
+                if SIZES.pop(block, None):
+                    kb(block, "viewport", "reset")
+
+
+def kb_shot(block, msg):
+    """The picture of a kb pane's page, at the size the tablet shows it."""
+    if not getattr(kb_shot, "started", False):
+        kb_shot.started = True
+        threading.Thread(target=kb_release, daemon=True).start()
+    KB_USED[block] = time.time()
+    tag = "".join(c for c in block[-8:] if c.isalnum())
+    png, jpg = os.path.join(HOME, f"web-{tag}.png"), os.path.join(HOME, f"web-{tag}.jpg")
+    zoom = max(25, min(400, int(msg.get("zoom") or 100)))
+    w, h = int(msg.get("w") or 0), int(msg.get("h") or 0)
+    want = (round(w * 50 / zoom), round(h * 50 / zoom))
+    if min(want) >= 100 and SIZES.get(block) != want:
+        ok, _ = kb(block, "viewport", f"{want[0]}x{want[1]}")
+        SIZES[block] = want if ok else None
+        time.sleep(0.3)  # the page lays itself out again
+    state = kb_eval(block, JS_STATE).get("value")
+    if not isinstance(state, dict):
+        state = {}
+    width = max(64, min(w or 1200, 1620))
+    ok, out = kb(block, "screenshot", "--size", str(width), "--out", png)
+    if not ok:
+        return {"error": out}
+    ok, status = kb(block, "status")
+    info = dict(line.split(": ", 1) for line in status.splitlines() if ": " in line) if ok else {}
+    done = subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "50", png, "--out", jpg],
+                          capture_output=True)
+    if done.returncode != 0:
+        return {"error": "couldn't make the picture: " + done.stderr.decode(errors="replace")[:120]}
+    with open(jpg, "rb") as f:
+        digest = hashlib.sha1(f.read()).hexdigest()[:16]
+    out = {"hash": digest, "url": info.get("url", ""), "title": info.get("title", ""),
+           "loading": info.get("loading", "no") != "no", "vw": state.get("vw", 0), "vh": state.get("vh", 0),
+           "y": state.get("y", 0), "full": state.get("full", 0), "edit": bool(state.get("edit"))}
+    if digest == msg.get("last"):
+        out["same"] = True
+    else:
+        out["path"] = jpg
+    return out
+
+
+KB_KEYS = {"enter": "Enter", "backspace": "Backspace", "tab": "Tab", "escape": "Escape", "up": "ArrowUp",
+           "down": "ArrowDown", "left": "ArrowLeft", "right": "ArrowRight", "pageup": "PageUp", "pagedown": "PageDown"}
+
+
+def kb_act(op, block, msg):
+    """Do something to a kb pane's page -> {"ok": 1} or {"error": ...}."""
+    KB_USED[block] = time.time()
+
+    def settle(reply):
+        # Give a click or a key that loads a page time to start, then to finish.
+        if reply.get("error"):
+            return {"error": reply["error"]}
+        time.sleep(0.15)
+        until = time.time() + 6
+        while time.time() < until:
+            ok, status = kb(block, "status")
+            if not ok or "loading: yes" not in status:
+                break
+            time.sleep(0.2)
+        return {"ok": 1}
+
+    def did(ok_out):
+        return {} if ok_out[0] else {"error": ok_out[1]}
+
+    def done(reply):
+        # kb ctl waits for the page itself after these.
+        return {"error": reply["error"]} if reply.get("error") else {"ok": 1}
+
+    if op == "tap":
+        return settle(kb_eval(block, JS_TAP % (float(msg.get("x", 0)), float(msg.get("y", 0)))))
+    if op == "scroll":
+        reply = kb_eval(block, f"scrollBy({{top: {float(msg.get('dy', 0))}, behavior: 'instant'}})")
+        time.sleep(0.03)
+        return {"error": reply["error"]} if reply.get("error") else {"ok": 1}
+    if op == "text":
+        return done(did(kb(block, "type", ":focus", str(msg.get("text", "")))))
+    if op == "key":
+        name = KB_KEYS.get(str(msg.get("key", "")))
+        return done(did(kb(block, "press", name))) if name else {"error": "unknown key"}
+    if op == "nav":
+        return done(did(kb(block, "open", str(msg.get("url", "")), timeout=40)))
+    if op in ("back", "forward", "reload"):
+        return done(did(kb(block, op, timeout=40)))
+    return {"error": f"unknown browser request {op}"}
+
+
+def kb_open(msg):
+    """Open a kb pane beside a pane, or in a new tab -> {"block": its ID}."""
+    cmd = ["rex", "run"] if msg.get("tab") else ["rex", "split", "--split", str(msg.get("split", "right"))]
+    cmd += ["-s", str(msg.get("session", "")), "--label", "browser", "--focus=false", "--json"]
+    if not msg.get("tab"):
+        cmd += ["-b", str(msg.get("anchor", ""))]
+    cmd += ["--", find_kb()] + ([str(msg["url"])] if msg.get("url") else [])
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return {"block": json.loads(done.stdout)["block_ids"][0]}
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError):
+        return {"error": "couldn't open a kb pane on the Mac"}
+
+
 def web(msg):
     """One browser-pane request -> the reply's fields."""
     op, block = msg.get("web"), msg.get("block", "")
     pane = {"id": block}
+
+    if op == "open" and os.path.exists(find_kb()):
+        return kb_open(msg)
+    if op != "open" and kb_id(block):
+        if op != "shot":
+            reply = kb_act(op, block, msg)
+            if reply.get("error") or not msg.get("w"):
+                return reply
+        return kb_shot(block, msg)
 
     if op != "shot":
         reply = web_act(op, pane, msg)

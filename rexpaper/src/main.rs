@@ -1225,13 +1225,16 @@ impl App {
 
     /// Attach to the tab's session, claim its terminals, size them to this
     /// screen and start following their output.
-    /// Whether a terminal block is a rexweb pane.
+    /// Whether a terminal block is a browser pane: rexweb's or kb's.
     fn is_browser(&mut self, sid: &str, bid: &str, label: &str) -> bool {
         label == web::LABEL
             || self.ctl.as_mut().is_some_and(|ctl| {
                 let args = json!({"format": "text", "trim": true, "max_bytes": 400});
                 ctl.terminal(&mut self.net, "format", sid, bid, args)
-                    .is_ok_and(|v| v["content"].as_str().is_some_and(|t| t.trim_start().starts_with(web::SCREEN)))
+                    .is_ok_and(|v| v["content"].as_str().is_some_and(|t| {
+                        let t = t.trim_start();
+                        t.starts_with(web::SCREEN) || t.starts_with(web::SCREEN_KB)
+                    }))
             })
     }
 
